@@ -1,0 +1,75 @@
+{
+  "name": "mlx-code-completion",
+  "displayName": "MLX Code Completion",
+  "description": "Low-latency AI code completion powered by local MLX models on Apple Silicon",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "MLX Code Completion",
+      "properties": {
+        "mlxCompletion.modelPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the MLX model directory (e.g., ~/mlx-models/Qwen2.5-Coder-3B-Instruct-MLX-4bit)"
+        },
+        "mlxCompletion.quantization": {
+          "type": "string",
+          "enum": ["4bit", "8bit", "BF16"],
+          "default": "4bit",
+          "description": "Quantization level for the MLX model"
+        },
+        "mlxCompletion.debounceMs": {
+          "type": "number",
+          "default": 50,
+          "minimum": 40,
+          "maximum": 200,
+          "description": "Debounce delay in milliseconds (40-200)"
+        },
+        "mlxCompletion.maxTokens": {
+          "type": "number",
+          "default": 64,
+          "description": "Maximum tokens to generate per completion"
+        },
+        "mlxCompletion.contextLinesBefore": {
+          "type": "number",
+          "default": 150,
+          "description": "Number of lines before cursor to include in context"
+        },
+        "mlxCompletion.contextLinesAfter": {
+          "type": "number",
+          "default": 35,
+          "description": "Number of lines after cursor to include in context"
+        },
+        "mlxCompletion.temperature": {
+          "type": "number",
+          "default": 0.0,
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "description": "Generation temperature (0.0 = deterministic)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.0"
+  }
+}

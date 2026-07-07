@@ -1,0 +1,7 @@
+{
+    "extensions.ignoreRecommendations": true,
+    "typescript.tsdk": "node_modules/typescript/lib",
+    "terminal.integrated.env.osx": {
+        "PYTHONUNBUFFERED": "1"
+    }
+}
