@@ -1,131 +1,139 @@
 /**
- * Inline completion provider.
+ * Completion provider.
  *
- * Uses VS Code's InlineCompletionItemProvider API (like GitHub Copilot)
- * to show streaming, token-by-token completions as inline ghost text.
- * Listens for cursor position changes (keyboard only), debounces input,
- * extracts document context, and streams completions from the MLX backend.
+ * Uses the traditional CompletionItemProvider. Returns a Thenable that
+ * resolves with completion items after the MLX backend finishes generating.
+ * VS Code waits for the Thenable and displays the results.
  */
 
 import * as vscode from "vscode";
-import { extractContext } from "./context-extractor";
+import { extractContext, DocumentContext } from "./context-extractor";
 import { BackendIPC, TokenCallback } from "./backend-ipc";
 
-/**
- * A running completion session. Tracks the current request so we can
- * cancel it when the user types again.
- */
-interface CompletionSession {
-    controller: vscode.CancellationTokenSource;
-    item: vscode.InlineCompletionItem;
-    accumulated: string;
-}
-
-export class InlineCompletionProvider implements vscode.InlineCompletionItemProvider {
-    private currentSession: CompletionSession | null = null;
-    private lastRequestKey = "";
+export class CompletionProvider implements vscode.CompletionItemProvider {
+    private lastContextKey = "";
     private debounceTimer: ReturnType<typeof setTimeout> | null = null;
     private debounceMs: number;
     private maxTokens: number;
+    private backend: BackendIPC;
 
-    constructor(
-        private backend: BackendIPC,
-        debounceMs: number,
-        maxTokens: number,
-    ) {
+    constructor(backend: BackendIPC, debounceMs: number, maxTokens: number) {
+        this.backend = backend;
         this.debounceMs = debounceMs;
         this.maxTokens = maxTokens;
     }
 
-    /**
-     * Called by VS Code when inline completions are requested.
-     * We return null immediately and stream completions via the callback.
-     */
-    async provideInlineCompletionItems(
+    async provideCompletionItems(
         document: vscode.TextDocument,
         position: vscode.Position,
-        context: vscode.InlineCompletionContext,
         token: vscode.CancellationToken,
-    ): Promise<vscode.InlineCompletionItem[] | null> {
+        _context: vscode.CompletionContext,
+    ): Promise<vscode.CompletionItem[]> {
         // Only work with file URIs
         if (document.uri.scheme !== "file") {
-            return null;
+            return [];
         }
 
         // Ignore if cursor is at the very start
         if (position.line === 0 && position.character === 0) {
-            return null;
+            return [];
         }
 
-        // Build a request key to detect meaningful changes
-        const requestKey = `${position.line}:${position.character}:${document.languageId}`;
-        if (requestKey === this.lastRequestKey) {
-            return null;
-        }
-        this.lastRequestKey = requestKey;
-
-        // Cancel any in-flight session
-        this.cancelSession();
-
-        // Check if cursor is at a valid position (not inside a multi-line comment)
+        // Check if cursor is at a valid position
         if (!this.isCompletionValid(document, position)) {
-            return null;
+            return [];
         }
 
-        // Extract context window
-        const docContext = extractContext(document, position, 150, 35);
+        // Build a context key to detect meaningful changes
+        const contextData = extractContext(document, position, 150, 35);
+        const contextKey = `${contextData.before.length}:${contextData.after.length}:${position.line}:${position.character}`;
 
-        // Create a cancellation token for this request
-        const controller = new vscode.CancellationTokenSource();
-        const requestToken = controller.token;
+        // Don't re-request if context hasn't changed
+        if (contextKey === this.lastContextKey) {
+            return [];
+        }
+        this.lastContextKey = contextKey;
 
-        // Listen for top-level cancellation (e.g., user presses Escape)
-        token.onCancellationRequested(() => {
-            controller.cancel();
-            controller.dispose();
-            this.cancelSession();
+        // Cancel any pending debounce
+        if (this.debounceTimer !== null) {
+            clearTimeout(this.debounceTimer);
+            this.debounceTimer = null;
+        }
+
+        // Debounce: wait for user to stop typing
+        return new Promise<vscode.CompletionItem[]>((resolve) => {
+            this.debounceTimer = setTimeout(async () => {
+                this.debounceTimer = null;
+
+                // Check if cancelled during debounce
+                if (token.isCancellationRequested) {
+                    resolve([]);
+                    return;
+                }
+
+                try {
+                    const controller = new vscode.CancellationTokenSource();
+                    const requestToken = controller.token;
+
+                    // Listen for cancellation (when user types again during generation)
+                    token.onCancellationRequested(() => {
+                        controller.cancel();
+                        controller.dispose();
+                        resolve([]);
+                    });
+
+                    // Stream callback — accumulate tokens
+                    let accumulated = "";
+                    const onToken: TokenCallback = (tokenText: string) => {
+                        if (requestToken.isCancellationRequested || token.isCancellationRequested) {
+                            return;
+                        }
+                        if (tokenText) {
+                            accumulated += tokenText;
+                        }
+                        // Empty token signals end of stream
+                    };
+
+                    // Send request to backend
+                    this.backend
+                        .complete(contextData, requestToken, onToken)
+                        .then(() => {
+                            controller.dispose();
+
+                            // Check if cancelled during generation
+                            if (requestToken.isCancellationRequested || token.isCancellationRequested) {
+                                resolve([]);
+                                return;
+                            }
+
+                            // If no tokens were streamed (backend returned empty), return empty
+                            if (!accumulated || accumulated.trim().length === 0) {
+                                resolve([]);
+                                return;
+                            }
+
+                            // Create completion item
+                            const wordRange = this.getWordRange(document, position);
+                            const item = new vscode.CompletionItem(
+                                accumulated.trim(),
+                                vscode.CompletionItemKind.Snippet,
+                            );
+                            item.insertText = accumulated;
+                            item.range = wordRange;
+                            item.detail = "MLX Code Completion";
+                            item.sortText = "\0"; // Put at the top
+
+                            resolve([item]);
+                        })
+                        .catch((err) => {
+                            controller.dispose();
+                            resolve([]);
+                        });
+                } catch (err) {
+                    resolve([]);
+                }
+            }, this.debounceMs);
         });
-
-        // Create the inline completion item (empty initially, filled by streaming)
-        const wordRange = this.getWordRange(document, position);
-        const item = new vscode.InlineCompletionItem("", wordRange);
-
-        // Track the session
-        this.currentSession = {
-            controller,
-            item,
-            accumulated: "",
-        };
-
-        // Streaming callback — called for each token from the backend
-        const onToken: TokenCallback = (tokenText: string) => {
-            if (requestToken.isCancellationRequested || token.isCancellationRequested) {
-                return;
-            }
-
-            if (tokenText) {
-                this.currentSession!.accumulated += tokenText;
-                this.currentSession!.item.insertText = this.currentSession!.accumulated;
-
-                // Notify VS Code that the inline item has been updated
-                // This triggers a re-render with the new text
-                vscode.commands.executeCommand("editor.action.inlineSuggest.trigger");
-            } else {
-                // Empty token signals end of stream
-                this.cancelSession();
-            }
-        };
-
-        // Send request to backend
-        try {
-            await this.backend.complete(docContext, requestToken, onToken);
-        } catch {
-            // Request was cancelled or errored — session already cleaned up
-        }
-
-        // Return null because we're streaming updates, not returning items upfront
-        // VS Code will see the updated item via the inline suggest commands
-        return null;
     }
 
     private isCompletionValid(document: vscode.TextDocument, position: vscode.Position): boolean {
@@ -145,11 +153,10 @@ export class InlineCompletionProvider implements vscode.InlineCompletionItemProv
         return word || new vscode.Range(position, position);
     }
 
-    private cancelSession(): void {
-        if (this.currentSession) {
-            this.currentSession.controller.cancel();
-            this.currentSession.controller.dispose();
-            this.currentSession = null;
+    dispose(): void {
+        if (this.debounceTimer !== null) {
+            clearTimeout(this.debounceTimer);
+            this.debounceTimer = null;
         }
     }
 }
