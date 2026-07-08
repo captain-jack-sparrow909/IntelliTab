@@ -93,12 +93,57 @@ class ModelEngine:
         self.sampler = make_sampler(temp=temperature, top_p=1.0)
 
     def build_fim_prompt(self, before: str, after: str) -> str:
-        """Build a FIM (Fill-in-the-Middle) prompt for Qwen2.5-Coder.
+        """Build a code-continuation prompt for Qwen2.5-Coder.
 
-        Format expected by the model's FIM training:
-            <|fim_begin|>{prefix}<|fim_end|>{suffix}<|fim_begin|><|fim_pad|><|fim_end|>{middle}
+        This model is an instruct model without true FIM training, so we use an
+        instruct prompt that asks it to output only the code to insert at the
+        cursor. Both the prefix (before cursor) and suffix (after cursor) are
+        provided so it can fill in the middle.
         """
-        return f"{FIM_BEGIN}{before}{FIM_END}{after}{FIM_BEGIN}{FIM_PAD}{FIM_END}"
+        system = (
+            "You are a code completion engine. Output ONLY the code that should "
+            "be inserted at the <cursor> position, continuing naturally from the "
+            "code before it and consistent with the code after it. Do not repeat "
+            "the existing code. No explanation, no markdown fences."
+        )
+        user = (
+            "Complete the code by outputting only what goes at <cursor>.\n\n"
+            "```javascript\n"
+            f"{before}\n<cursor>\n{after}\n```\n\n"
+            "Code to insert at <cursor>:"
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        return self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
+
+    def build_intent_prompt(self, intent: str) -> str:
+        """Build an instruct prompt for generating code from a comment/description.
+
+        Used when the user writes a comment (e.g. "// fetch user data") and we
+        want the model to generate the whole implementation, Copilot-style.
+        """
+        intent = intent.strip()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a coding assistant. Given a comment or description, "
+                    "write the corresponding code. Respond with only the code "
+                    "implementation, no explanation, no markdown fences."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Write code for the following:\n{intent}",
+            },
+        ]
+        return self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
 
     def generate(
         self,

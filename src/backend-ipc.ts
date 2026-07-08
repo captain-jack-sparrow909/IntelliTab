@@ -20,6 +20,7 @@ export interface CompleteRequest {
         before: string;
         after: string;
         language: string;
+        intent?: string;
      };
     maxTokens?: number;
     streaming?: boolean;
@@ -299,9 +300,10 @@ export class BackendIPC {
 
      /** Send a completion request to the backend. */
     complete(
-        context: { before: string; after: string; language: string },
+        context: { before: string; after: string; language: string; intent?: string },
         token: vscode.CancellationToken,
         onToken?: TokenCallback,
+        maxTokens?: number,
     ): Promise<string> {
         if (!this.process?.stdin) {
             throw new Error("Backend process not started");
@@ -312,7 +314,7 @@ export class BackendIPC {
             type: "complete",
             id,
             context,
-            maxTokens: this.maxTokens,
+            maxTokens: maxTokens ?? this.maxTokens,
             streaming: true,
         };
 

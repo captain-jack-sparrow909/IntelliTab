@@ -21,7 +21,7 @@ from model import ModelEngine
 
 
 # Default model path — can be overridden via config
-DEFAULT_MODEL_PATH = Path.home() / ".mlx-models" / "Qwen2.5-Coder-3B-Instruct-MLX-4bit"
+DEFAULT_MODEL_PATH = Path.home() / ".mlx-models" / "Qwen2.5-Coder-7B-Instruct-MLX-4bit"
 
 
 def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
@@ -39,7 +39,10 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
     try:
         if use_streaming:
             # Streaming mode: send tokens one by one
-            prompt = engine.build_fim_prompt(context["before"], context["after"])
+            if context.get("intent"):
+                prompt = engine.build_intent_prompt(context["intent"])
+            else:
+                prompt = engine.build_fim_prompt(context["before"], context["after"])
             tokens_sent = 0
             for token, is_final in engine.stream(prompt, max_tokens=max_tokens, msg_id=msg_id):
                 if not token:
@@ -52,7 +55,10 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
             write(encode_token("", msg_id))
         else:
             # Non-streaming: send full completion at once
-            prompt = engine.build_fim_prompt(context["before"], context["after"])
+            if context.get("intent"):
+                prompt = engine.build_intent_prompt(context["intent"])
+            else:
+                prompt = engine.build_fim_prompt(context["before"], context["after"])
             completion = engine.generate(prompt, max_tokens=max_tokens, msg_id=msg_id)
             write(encode_complete(completion, msg_id))
 
