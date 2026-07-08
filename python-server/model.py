@@ -120,26 +120,39 @@ class ModelEngine:
             messages, add_generation_prompt=True, tokenize=False
         )
 
-    def build_intent_prompt(self, intent: str) -> str:
+    def build_intent_prompt(self, intent: str, language: str = "javascript", context: str = "") -> str:
         """Build an instruct prompt for generating code from a comment/description.
 
         Used when the user writes a comment (e.g. "// fetch user data") and we
         want the model to generate the whole implementation, Copilot-style.
+        `language` is the editor language id (e.g. "javascript") and `context`
+        is the surrounding code so the generated style/indentation matches.
         """
         intent = intent.strip()
+        language = (language or "javascript").strip()
+        lang_name = {
+            "js": "JavaScript", "javascript": "JavaScript", "ts": "TypeScript",
+            "typescript": "TypeScript", "py": "Python", "python": "Python",
+            "java": "Java", "go": "Go", "rust": "Rust", "cpp": "C++", "c": "C",
+            "csharp": "C#", "rb": "Ruby", "php": "PHP", "sh": "Shell",
+            "shellscript": "Shell", "html": "HTML", "css": "CSS",
+        }.get(language.lower(), language)
+        surrounding = (context or "").strip()
+        system = (
+            f"You are a code completion engine. Write code in {lang_name} only. "
+            "Match the existing code style and indentation of the surrounding "
+            "code. Respond with ONLY the code implementation, no explanation, "
+            "no markdown fences."
+        )
+        user_parts = [f"Write {lang_name} code for the following request:\n{intent}"]
+        if surrounding:
+            user_parts.append(
+                "The code should be placed in this file. Match its style and "
+                "indentation:\n```\n" + surrounding + "\n```"
+            )
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a coding assistant. Given a comment or description, "
-                    "write the corresponding code. Respond with only the code "
-                    "implementation, no explanation, no markdown fences."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Write code for the following:\n{intent}",
-            },
+            {"role": "system", "content": system},
+            {"role": "user", "content": "\n\n".join(user_parts)},
         ]
         return self.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False

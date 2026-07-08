@@ -40,7 +40,9 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
         if use_streaming:
             # Streaming mode: send tokens one by one
             if context.get("intent"):
-                prompt = engine.build_intent_prompt(context["intent"])
+                prompt = engine.build_intent_prompt(
+                    context["intent"], language, context.get("before", "")
+                )
             else:
                 prompt = engine.build_fim_prompt(context["before"], context["after"])
             tokens_sent = 0
@@ -56,7 +58,9 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
         else:
             # Non-streaming: send full completion at once
             if context.get("intent"):
-                prompt = engine.build_intent_prompt(context["intent"])
+                prompt = engine.build_intent_prompt(
+                    context["intent"], language, context.get("before", "")
+                )
             else:
                 prompt = engine.build_fim_prompt(context["before"], context["after"])
             completion = engine.generate(prompt, max_tokens=max_tokens, msg_id=msg_id)

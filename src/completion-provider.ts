@@ -156,7 +156,24 @@ export class CompletionProvider implements vscode.CompletionItemProvider {
                 )
                 .then(() => {
                     this.inFlight.delete(contextKey);
-                    const cleaned = cleanCompletion(accumulated, contextData.before, isIntent);
+                    let cleaned = cleanCompletion(accumulated, contextData.before, isIntent);
+                    if (cleaned && isIntent) {
+                        // Normalize indentation: dedent the block, then indent it
+                        // to match the cursor line so it nests correctly.
+                        const lines = cleaned.split("\n");
+                        const indents = lines.filter((l) => l.trim().length > 0)
+                            .map((l) => l.match(/^\s*/)?.[0].length ?? 0);
+                        const minIndent = indents.length ? Math.min(...indents) : 0;
+                        const dedented = lines
+                            .map((l) => (l.length >= minIndent ? l.slice(minIndent) : l))
+                            .join("\n");
+                        const lineText = document.lineAt(position.line).text;
+                        const indent = lineText.match(/^\s*/)?.[0] ?? "";
+                        cleaned = dedented
+                            .split("\n")
+                            .map((ln, i) => (i === 0 || ln.length === 0 ? ln : indent + ln))
+                            .join("\n");
+                    }
                     if (cleaned) {
                         this.completions.set(contextKey, cleaned);
                         log(`[Provider] -> cached completion (${cleaned.length} chars)`);
