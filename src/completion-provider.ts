@@ -149,7 +149,7 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
                     this.pendingResolve = null;
                     this.pendingPosition = null;
                     this.pendingContextKey = null;
-                } else if (completion) {
+                } else if (cleaned) {
                     // VS Code didn't keep our request open (it cancelled it, which
                     // is common). Re-trigger inline suggestions so the provider is
                     // invoked again and can serve the now-cached completion.
