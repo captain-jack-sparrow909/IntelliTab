@@ -1,6 +1,7 @@
 {
     "extensions.ignoreRecommendations": true,
     "typescript.tsdk": "node_modules/typescript/lib",
+    "editor.inlineSuggest.enabled": true,
     "terminal.integrated.env.osx": {
         "PYTHONUNBUFFERED": "1"
     }
