@@ -9,33 +9,35 @@ VS Code Extension (TypeScript)
     ── stdin/stdout pipes (length-prefixed JSON) ──
 Python MLX Server (persistent process)
     ── Metal (GPU) ──
-   Qwen2.5-Coder-3B-Instruct-MLX-4bit
+   Qwen2.5-Coder-7B-Instruct-MLX-4bit (default)
 ```
 
 No REST server, no Ollama, no OpenAI-compatible API. Just native IPC.
 
 ## Features
 
-- **Fill-in-the-Middle (FIM)** prompting — sends `<fim_prefix>{before}<fim_suffix>{after}<fim_middle>` for precise completions
-- **Streaming ghost text** — completions appear token-by-token as inline suggestions (like GitHub Copilot), not a dropdown list
-- **Persistent model** — loaded once on extension activation, never unloaded
-- **Debounce** (40–200ms configurable, default 50ms) to avoid spamming the model
-- **Cancellation** — in-flight completions are cancelled when you type again
-- **150-line context window** — only the relevant surrounding code is sent (150 lines before cursor, 35 after)
+- **Copilot-style completions** — completions appear in the native VS Code suggestion widget (dropdown) as you type, triggered on common characters (`.`, `(`, ` `, `=`, etc.). Accept with `Tab`/`Enter`.
+- **Intent / comment-to-code** — write a comment like `// write a function that calculates factorial` and the model generates the full implementation, in the file's language and matching the surrounding style.
+- **Instruct-based continuation** — uses the model's chat/instruct template with the code before *and* after the cursor, so it fills in the middle correctly (the base model has no true FIM training).
+- **Streaming** — tokens stream from the model and the suggestion updates as it generates.
+- **Persistent model** — loaded once on extension activation, never unloaded.
+- **Debounce** (40–200ms configurable, default 50ms) to avoid spamming the model.
+- **150-line context window** — only the relevant surrounding code is sent (150 lines before cursor, 35 after).
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| First token latency | ~210ms |
-| Model size | ~2 GB RAM (4-bit quantized) |
-| Max tokens per completion | 64 (configurable) |
+| First token latency | ~210ms (3B) / ~300–400ms (7B) |
+| Model size | ~2 GB RAM (3B, 4-bit) / ~4.3 GB RAM (7B, 4-bit) |
+| Max tokens per completion | 64 (configurable; 512 for intent mode) |
 
 ## Requirements
 
 - **Apple Silicon Mac** (M1/M2/M3/M4) with MLX support
 - **Python 3.10+** on PATH
-- **~4–8 GB RAM** free (model uses ~2 GB for 4-bit)
+- **~6–8 GB RAM** free for the default 7B model (4-bit); ~4 GB for the 3B model
+- The `code` CLI on PATH (run **Shell Command: Install 'code' command in PATH** from the VS Code command palette, or the F5 debug launch may fail to open the Extension Development Host)
 
 ## Setup
 
@@ -47,16 +49,15 @@ pip install -r python-server/requirements.txt
 
 ### 2. Download the model
 
-The model should be downloaded at `~/.mlx-models/Qwen2.5-Coder-3B-Instruct-MLX-4bit`.
-
-If you need to re-download:
+The default model is **Qwen2.5-Coder-7B-Instruct-MLX-4bit** and should be at
+`~/.mlx-models/Qwen2.5-Coder-7B-Instruct-MLX-4bit`. If it is missing, download it:
 
 ```bash
-huggingface-cli download lmstudio-community/Qwen2.5-Coder-3B-Instruct-MLX-4bit \
-    --local-dir ~/.mlx-models/Qwen2.5-Coder-3B-Instruct-MLX-4bit
+python -c "from huggingface_hub import snapshot_download; snapshot_download('lmstudio-community/Qwen2.5-Coder-7B-Instruct-MLX-4bit', local_dir='~/.mlx-models/Qwen2.5-Coder-7B-Instruct-MLX-4bit')"
 ```
 
-Or via Python:
+For a lighter/faster option, the 3B model also works (set `mlxCompletion.modelPath`
+accordingly):
 
 ```bash
 python -c "from huggingface_hub import snapshot_download; snapshot_download('lmstudio-community/Qwen2.5-Coder-3B-Instruct-MLX-4bit', local_dir='~/.mlx-models/Qwen2.5-Coder-3B-Instruct-MLX-4bit')"
@@ -68,27 +69,13 @@ Open VS Code Settings (`Cmd+,`) and search for "MLX Code Completion". Set:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `mlxCompletion.modelPath` | `""` | Path to MLX model directory (auto-detects quantization from config.json) |
-| `mlxCompletion.quantization` | `4bit` | Quantization level (`4bit`, `6bit`, `8bit`, `BF16`) — only applied if model isn't already quantized |
-| `mlxCompletion.debounceMs` | `50` | Debounce delay (40–200 ms) |
-| `mlxCompletion.maxTokens` | `64` | Maximum tokens to generate per completion |
-| `mlxCompletion.temperature` | `0.0` | Generation temperature (0.0 = deterministic) |
-| `mlxCompletion.contextLinesBefore` | `150` | Lines before cursor to include |
-| `mlxCompletion.contextLinesAfter` | `35` | Lines after cursor to include |
-
-Or set in `settings.json`:
-
-```json
-{
-    "mlxCompletion.modelPath": "~/.mlx-models/Qwen2.5-Coder-3B-Instruct-MLX-4bit",
-    "mlxCompletion.quantization": "4bit",
-    "mlxCompletion.debounceMs": 50,
-    "mlxCompletion.maxTokens": 64,
-    "mlxCompletion.temperature": 0.0,
-    "mlxCompletion.contextLinesBefore": 150,
-    "mlxCompletion.contextLinesAfter": 35
-}
-```
+| `mlxCompletion.modelPath` | `""` | Path to MLX model directory. Empty = the built-in default (7B). |
+| `mlxCompletion.quantization` | `4bit` | Quantization level (`4bit`, `8bit`, `BF16`) — only applied if the model isn't already quantized. |
+| `mlxCompletion.debounceMs` | `50` | Debounce delay (40–200 ms). |
+| `mlxCompletion.maxTokens` | `64` | Maximum tokens to generate per completion. |
+| `mlxCompletion.temperature` | `0.0` | Generation temperature (0.0 = deterministic). |
+| `mlxCompletion.contextLinesBefore` | `150` | Lines before cursor to include. |
+| `mlxCompletion.contextLinesAfter` | `35` | Lines after cursor to include. |
 
 ### 4. Build and run
 
@@ -98,36 +85,40 @@ npm run compile
 ```
 
 Then open the extension in VS Code:
-1. Open this folder in VS Code
-2. Press `F5` (Debug: Start Debugging)
-3. A new VS Code window opens with the extension loaded
-4. Open any code file and start typing — ghost text appears as you type
+1. Open this folder in VS Code.
+2. Press `F5` (Debug: Start Debugging). A new **Extension Development Host** window opens with the extension loaded and the project folder open.
+3. In the host window, open a code file and start typing. Suggestions appear in the dropdown; accept with `Tab`/`Enter`.
+4. For comment-to-code: write a comment describing a function, press Enter to a new line, then type a space to get the implementation.
+
+> **Tip:** If `editor.quickSuggestions` is off for the language, the dropdown may not auto-show. You can always press `Ctrl+Space` to trigger it manually. The extension also enables `editor.inlineSuggest.enabled` and `editor.quickSuggestions` on activation.
 
 ## How It Works
 
 ### VS Code Extension (`src/`)
 
-1. **`extension.ts`** — Entry point. Spawns the Python process, registers the inline completion provider. On `activate()`, the model loads immediately. On `deactivate()`, the process is killed.
-2. **`completion-provider.ts`** — Implements `InlineCompletionItemProvider`. Listens for cursor position changes (keyboard only), debounces input, extracts document context, and streams completions back as inline ghost text.
-3. **`context-extractor.ts`** — Reads the document around the cursor: 150 lines before, 35 lines after. Returns a structured context object.
-4. **`backend-ipc.ts`** — Manages the child process lifecycle and the length-prefixed JSON IPC protocol. Handles streaming token callbacks, cancellation, and health checks.
+1. **`extension.ts`** — Entry point. Spawns the Python process, registers the completion provider (`CompletionItemProvider`) with trigger characters, and force-enables inline/quick suggestions. On `activate()` the model loads immediately; on `deactivate()` the process is killed.
+2. **`completion-provider.ts`** — Implements `CompletionItemProvider`. Detects Copilot-style *intent* (a comment or function signature at/above the cursor), extracts document context, and returns a `CompletionItem` with the streamed result. Caches completions per context and dedents/re-indents generated blocks to match the cursor.
+3. **`context-extractor.ts`** — Reads the document around the cursor (150 lines before, 35 after). Also implements `detectIntent()` for comment/signature → code, and strips a leading bracket from the suffix so the model completes a body instead of echoing a signature.
+4. **`backend-ipc.ts`** — Manages the child process lifecycle and the length-prefixed JSON IPC protocol. Handles streaming token callbacks and resolves the request when the stream ends.
 5. **`debounce.ts`** — Debounce utility with `cancel()` and `flush()` methods.
 
 ### Python MLX Server (`python-server/`)
 
-1. **`server.py`** — Main server loop. Reads messages from stdin, dispatches to the model engine. Never unloads the model.
-2. **`model.py`** — Loads Qwen2.5-Coder via MLX. Auto-detects whether the model is already quantized (by checking `config.json` for a `quantization` key) to avoid double-quantizing. Handles FIM prompt construction and both sync/streaming generation.
+1. **`server.py`** — Main server loop. Reads messages from stdin, dispatches to the model engine. Never unloads the model. Passes `--model`, `--quantization`, `--max-tokens`, and `--temperature` from the extension settings.
+2. **`model.py`** — Loads Qwen2.5-Coder via MLX. Builds either an **instruct continuation prompt** (code before + after the cursor, asking the model to output only the inserted code) or an **intent prompt** (comment/description → full implementation in the file's language, matching surrounding style). Both use the model's chat template. Auto-detects whether the model is already quantized.
 3. **`protocol.py`** — Length-prefixed JSON encoding/decoding: `[4 bytes big-endian uint32][JSON body]`.
 
 ### Protocol
 
 ```
-VS Code ──→ [4-byte length][JSON: {type:"complete", id:1, context:{...}}] ──→ Python
-Python ──→ [4-byte length][JSON: {type:"stream", id:1, token:"def "}] ──→ VS Code
-Python ──→ [4-byte length][JSON: {type:"stream", id:1, token:"add"}] ──→ VS Code
+VS Code ──→ [4-byte length][JSON: {type:"complete", id:1, context:{before, after, language, intent?}}] ──→ Python
+Python ──→ [4-byte length][JSON: {type:"stream", id:1, token:"a "}] ──→ VS Code
+Python ──→ [4-byte length][JSON: {type:"stream", id:1, token:"+ "}] ──→ VS Code
 ...
-Python ──→ [4-byte length][JSON: {type:"stream", id:1, token:""}] ──→ VS Code   (empty token = done)
+Python ──→ [4-byte length][JSON: {type:"stream", id:1, token:""}] ──→ VS Code   (empty token = end of stream)
 ```
+
+The `intent` field is present only for comment-to-code requests.
 
 ## File Structure
 
@@ -136,35 +127,40 @@ ide-extension/
 ├── package.json               # Extension manifest with settings
 ├── tsconfig.json              # TypeScript config
 ├── .gitignore
-├── .vscode/settings.json      # Dev settings
+├── .vscode/
+│   ├── settings.json          # Dev settings (enables inline + quick suggestions)
+│   ├── launch.json            # Debug launch (uses the `code` binary)
+│   └── tasks.json             # npm: compile task
 ├── README.md
 ├── src/
 │   ├── extension.ts           # Entry point — spawns backend, registers provider
-│   ├── completion-provider.ts # InlineCompletionItemProvider (streaming ghost text)
-│   ├── context-extractor.ts   # Extracts context window from document
+│   ├── completion-provider.ts # CompletionItemProvider (dropdown suggestions) + intent mode
+│   ├── context-extractor.ts   # Extracts context window + detects intent
 │   ├── backend-ipc.ts         # Child process + length-prefixed JSON IPC
 │   └── debounce.ts            # Debounce utility
 └── python-server/
     ├── server.py              # Main server loop
-    ├── model.py               # MLX model loading, FIM prompting, streaming
+    ├── model.py               # MLX model loading, instruct/intent prompting, streaming
     ├── protocol.py            # Length-prefixed JSON encoding/decoding
     └── requirements.txt       # mlx, mlx-lm
 ```
 
 ## Troubleshooting
 
-- **"Python 3 not found"** — Install Python 3.10+ and ensure it's on PATH (`which python3`)
-- **"Model not found"** — Set `mlxCompletion.modelPath` to your downloaded model directory. Default is `~/.mlx-models/Qwen2.5-Coder-3B-Instruct-MLX-4bit`
-- **"Failed to start backend"** — Check that the model files exist at the configured path (look for `config.json` and `model.safetensors`)
-- **High latency** — Try a lower quantization (4bit vs 8bit) or reduce `contextLinesBefore`
-- **Model OOM** — Use 4bit quantization (~2 GB) instead of BF16 (~6 GB)
-- **Model loads but produces no completions** — Make sure you're not at the very start of a document (position 0,0), and not inside a multi-line comment (`/* ... */`)
+- **F5 doesn't open the Extension Development Host** — the `code` binary must be on PATH. Run **Shell Command: Install 'code' command in PATH** from the command palette, or set `runtime` in `.vscode/launch.json` to the absolute path of `Visual Studio Code.app/Contents/Resources/app/bin/code`.
+- **"Python 3 not found"** — Install Python 3.10+ and ensure it's on PATH (`which python3`).
+- **"Model not found"** — Set `mlxCompletion.modelPath` to your downloaded model directory, or download the default 7B model (see Setup).
+- **"Failed to start backend"** — Check that the model files exist at the configured path (look for `config.json` and `model.safetensors`).
+- **No suggestions appear** — Open the **Output** panel (`Cmd+Shift+U`), select **"MLX Code Completion"**, and check the logs. Confirm the backend printed "Model loaded successfully" and that `provideCompletionItems called` appears when you type. If the dropdown still doesn't show, press `Ctrl+Space`.
+- **Wrong language generated from a comment** — The intent prompt uses the active file's language id; make sure the file has the correct language (e.g. a `.js` file is detected as JavaScript).
+- **Completion echoes what I already typed** — The cleanup strips a leading prefix that duplicates the current line; if it still echoes, the model is mid-identifier — type a space or finish the token and it will complete the rest.
+- **High latency / OOM** — Use the 3B model (`mlxCompletion.modelPath` → 3B path) or 4-bit quantization.
 
 ## Future Work
 
-- [x] Speculative decoding with a 1B–2B draft model
+- [ ] Speculative decoding with a 1B–2B draft model (faster first token)
+- [ ] Prefix caching of the system + file-context prompt
+- [ ] Completion ranking / re-ranking across multiple candidates
+- [ ] Inline ghost-text mode (requires the `inlineCompletionsAdditions` proposed API)
 - [ ] Support for JetBrains IDEs (PyCharm, etc.)
-- [ ] Language-specific prompt templates
-- [ ] Completion ranking / re-ranking
-- [ ] Configurable trigger characters (currently triggers on `.`, `(`, `"`, `'`, `` ` ``, `[`, `{`, ` `, `:`, `=`, `,`)
-- [ ] Inline completion widget with richer UI (accept/reject indicators)
+- [ ] Richer UI (accept/reject indicators, partial acceptance)
