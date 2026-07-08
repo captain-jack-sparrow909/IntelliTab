@@ -14,6 +14,8 @@ export interface DocumentContext {
     after: string;
     /** Current programming language identifier */
     language: string;
+    /** When set, generate code from this description/comment (Copilot-style) */
+    intent?: string;
 }
 
 /**
@@ -56,7 +58,15 @@ export function extractContext(
     const before = [...precedingLines, beforeCursor].join("\n");
 
     // Assemble after: current line suffix + following lines
-    const after = [afterCursor, ...followingLines].join("\n");
+    let after = [afterCursor, ...followingLines].join("\n");
+
+    // When the cursor sits right before an opening bracket (e.g. the cursor is
+    // at `const add = (a, b) => │{` and the file continues with `}`), the model
+    // gets confused and re-emits the signature. Strip a single leading bracket
+    // from `after` so the model completes the *body* instead.
+    if (after.startsWith("{") || after.startsWith("(") || after.startsWith("[")) {
+        after = after.slice(1);
+    }
 
     return {
         before,
@@ -64,3 +74,45 @@ export function extractContext(
         language: document.languageId,
     };
 }
+
+/**
+ * Detect a "Copilot-style" intent: the user wrote a comment describing code,
+ * or a function signature without a body, and we want the model to generate
+ * the implementation. Returns the intent text, or undefined if this is a
+ * normal mid-line completion.
+ */
+export function detectIntent(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+): string | undefined {
+    const lineCount = document.lineCount;
+    const currentLine = document.lineAt(position.line).text;
+    const beforeCursor = currentLine.substring(0, position.character);
+
+    // 1. Comment on the current line (e.g. "// fetch user data").
+    const commentMatch = beforeCursor.match(/(?:\/\/|#|"""|'''|\/\*)\s*(.+?)\s*$/);
+    if (commentMatch && commentMatch[1].length >= 3) {
+        return commentMatch[1];
+    }
+
+    // 2. A standalone comment line immediately above the cursor.
+    if (position.line > 0) {
+        const prevLine = document.lineAt(position.line - 1).text;
+        const prevComment = prevLine.match(/(?:\/\/|#|"""|'''|\/\*)\s*(.+?)\s*$/);
+        if (prevComment && prevComment[1].length >= 3 && beforeCursor.trim().length === 0) {
+            return prevComment[1];
+        }
+    }
+
+    // 3. A function/method signature without a body on the current line
+    //    (e.g. "function add(a, b) {" or "def add(a, b):" with no statements).
+    const sigMatch = beforeCursor.match(
+        /(function\s+[\w$]+\s*\([^)]*\)\s*\{?\s*$|def\s+[\w$]+\s*\([^)]*\)\s*:\s*$|[\w$]+\s*\([^)]*\)\s*(?:=>|->)\s*$)/,
+    );
+    if (sigMatch) {
+        return `Implement the following:\n${beforeCursor.trim()}`;
+    }
+
+    return undefined;
+}
+

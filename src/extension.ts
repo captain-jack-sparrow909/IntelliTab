@@ -19,13 +19,20 @@ export function activate(context: vscode.ExtensionContext): void {
         require("fs").writeFileSync("/tmp/mlx_activated.log", new Date().toISOString() + "\n");
     } catch {}
 
-    // Ensure inline suggestions are enabled in this window.
+    // Ensure inline suggestions and quick suggestions are enabled in this window.
     vscode.workspace
         .getConfiguration("editor")
         .update("inlineSuggest.enabled", true, vscode.ConfigurationTarget.Global)
         .then(
             () => outputChannel!.appendLine("[MLX] Enabled editor.inlineSuggest.enabled"),
             (e: any) => outputChannel!.appendLine(`[MLX] Could not enable inlineSuggest: ${e}`),
+        );
+    vscode.workspace
+        .getConfiguration("editor")
+        .update("quickSuggestions", { other: true, comments: false, strings: false }, vscode.ConfigurationTarget.Global)
+        .then(
+            () => outputChannel!.appendLine("[MLX] Enabled editor.quickSuggestions"),
+            (e: any) => outputChannel!.appendLine(`[MLX] Could not enable quickSuggestions: ${e}`),
         );
     vscode.window.showInformationMessage("MLX Code Completion: extension activated.");
 
@@ -97,37 +104,15 @@ export function activate(context: vscode.ExtensionContext): void {
     ];
     const selector = languages.map((l) => ({ language: l }));
 
-    const reg = vscode.languages.registerInlineCompletionItemProvider(selector, provider);
-    context.subscriptions.push(reg);
-    outputChannel.appendLine(`[MLX] Inline completion provider registered for ${languages.length} languages`);
-
-    // Fallback: a regular completion provider (dropdown). VS Code invokes this
-    // more readily than inline providers and confirms completion plumbing works.
-    const fallback = vscode.languages.registerCompletionItemProvider(
+    const reg = vscode.languages.registerCompletionItemProvider(
         selector,
-        {
-            async provideCompletionItems(document, position) {
-                outputChannel!.appendLine("[MLX][fallback] provideCompletionItems called");
-                const items = await provider.provideInlineCompletionItems(
-                    document,
-                    position,
-                    {} as any,
-                    { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) } as any,
-                );
-                return items.map((it) => {
-                    const c = new vscode.CompletionItem(
-                        (it.insertText as string) || "",
-                        vscode.CompletionItemKind.Snippet,
-                    );
-                    c.insertText = it.insertText as string;
-                    c.detail = "MLX Code Completion";
-                    return c;
-                });
-            },
-        },
+        provider,
+        // Trigger characters that prompt a completion request.
+        ".", "(", "\"", "'", "`", "[", "{", " ", ":", "=", ",", "\n",
+        ";", "!", ">", "<", "-", "_", "#", "@", "$", "%", "&", "*", "+", "/", "|", "~",
     );
-    context.subscriptions.push(fallback);
-    outputChannel.appendLine("[MLX] Fallback completion provider registered");
+    context.subscriptions.push(reg);
+    outputChannel.appendLine(`[MLX] Completion provider registered for ${languages.length} languages`);
 
     // Diagnostic: confirm the extension observes document changes in the host.
     context.subscriptions.push(

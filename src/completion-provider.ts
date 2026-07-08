@@ -3,7 +3,7 @@
  */
 
 import * as vscode from "vscode";
-import { extractContext, DocumentContext } from "./context-extractor";
+import { extractContext, detectIntent, DocumentContext } from "./context-extractor";
 import { BackendIPC, TokenCallback } from "./backend-ipc";
 
 let logFn: ((msg: string) => void) | null = null;
@@ -16,7 +16,7 @@ function log(msg: string): void {
     logFn?.(msg);
 }
 
-export class CompletionProvider implements vscode.InlineCompletionItemProvider {
+export class CompletionProvider implements vscode.CompletionItemProvider {
     private lastContextKey = "";
     private debounceTimer: ReturnType<typeof setTimeout> | null = null;
     private debounceMs: number;
@@ -29,12 +29,21 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
     // available when the provider is queried again (or on the next keystroke).
     private completions = new Map<string, string>();
     private inFlight = new Map<string, boolean>();
-    // Holds the active request's resolve + position so we can fulfill it with a
-    // (partial) completion once generation finishes, even though VS Code may
-    // cancel its own token in the meantime.
-    private pendingResolve: ((items: vscode.InlineCompletionItem[]) => void) | null = null;
-    private pendingPosition: vscode.Position | null = null;
-    private pendingContextKey: string | null = null;
+
+    private toCompletionItem(text: string, document: vscode.TextDocument, position: vscode.Position): vscode.CompletionItem {
+        const firstLine = text.split("\n")[0] || "completion";
+        const label = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
+        const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
+        const range = document.getWordRangeAtPosition(position) ?? new vscode.Range(position, position);
+        item.range = range;
+        item.insertText = new vscode.SnippetString(text);
+        item.detail = "MLX Code Completion";
+        item.documentation = new vscode.MarkdownString("```\n" + text + "\n```");
+        item.sortText = " ";
+        item.preselect = true;
+        return item;
+    }
+
 
     constructor(
         backend: BackendIPC,
@@ -53,13 +62,13 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
         log("Provider constructed");
     }
 
-    async provideInlineCompletionItems(
+    async provideCompletionItems(
         document: vscode.TextDocument,
         position: vscode.Position,
-        context: vscode.InlineCompletionContext,
         token: vscode.CancellationToken,
-    ): Promise<vscode.InlineCompletionItem[]> {
-        log(`[Provider] provideInlineCompletionItems called`);
+        context: vscode.CompletionContext,
+    ): Promise<vscode.CompletionItem[]> {
+        log(`[Provider] provideCompletionItems called`);
         log(`[Provider] document: ${document.uri.fsPath}`);
         log(`[Provider] scheme: ${document.uri.scheme}`);
         log(`[Provider] position: line=${position.line}, char=${position.character}`);
@@ -84,13 +93,21 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
         }
 
         // Build a context key
-        const contextData = extractContext(
+        const intent = detectIntent(document, position);
+        const contextData: DocumentContext = extractContext(
             document,
             position,
             this.linesBefore,
             this.linesAfter,
         );
-        const contextKey = `${contextData.before.length}:${contextData.after.length}:${position.line}:${position.character}`;
+        if (intent) {
+            contextData.intent = intent;
+        }
+        // Intent generations use a larger budget and aren't truncated to one line.
+        const isIntent = !!intent;
+        const contextKey = isIntent
+            ? `intent:${intent}:${position.line}:${position.character}`
+            : `${contextData.before.length}:${contextData.after.length}:${position.line}:${position.character}`;
 
         log(`[Provider] context key: ${contextKey}`);
         log(`[Provider] last context key: ${this.lastContextKey}`);
@@ -99,8 +116,7 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
         const cached = this.completions.get(contextKey);
         if (cached && cached.trim().length > 0) {
             log(`[Provider] -> returning cached completion (${cached.length} chars)`);
-            const item = new vscode.InlineCompletionItem(cached, new vscode.Range(position, position));
-            return [item];
+            return [this.toCompletionItem(cached, document, position)];
         }
 
         // If a generation for this context is already running, don't start another.
@@ -117,8 +133,9 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
         this.lastContextKey = contextKey;
 
         // Kick off generation. This runs to completion independent of VS Code's
-        // request cancellation — VS Code re-queries the provider (or the next
-        // keystroke does) and we return the cached result once ready.
+        // request cancellation. We return a promise that resolves with the
+        // completion as soon as generation finishes, so whichever caller invoked
+        // us (inline provider or fallback dropdown) gets the result directly.
         this.inFlight.set(contextKey, true);
         let accumulated = "";
         const streamCb: TokenCallback = (tokenText: string) => {
@@ -128,49 +145,33 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
             }
         };
 
-        log("[Provider] -> starting background generation");
-        this.backend
-            .complete(contextData, undefined as unknown as vscode.CancellationToken, streamCb)
-            .then(() => {
-                this.inFlight.delete(contextKey);
-                const cleaned = cleanCompletion(accumulated, contextData.before);
-                if (cleaned) {
-                    this.completions.set(contextKey, cleaned);
-                    log(`[Provider] -> cached completion (${cleaned.length} chars)`);
-                } else {
-                    log("[Provider] -> empty completion, not caching");
-                }
-                // If the request that started this generation is still waiting,
-                // fulfill it now with the result.
-                if (this.pendingResolve && this.pendingContextKey === contextKey) {
-                    const pos = this.pendingPosition!;
-                    const text = this.completions.get(contextKey);
-                    this.pendingResolve(text ? [new vscode.InlineCompletionItem(text, new vscode.Range(pos, pos))] : []);
-                    this.pendingResolve = null;
-                    this.pendingPosition = null;
-                    this.pendingContextKey = null;
-                } else if (cleaned) {
-                    // VS Code didn't keep our request open (it cancelled it, which
-                    // is common). Re-trigger inline suggestions so the provider is
-                    // invoked again and can serve the now-cached completion.
-                    log("[Provider] -> re-triggering inline suggestions");
-                    vscode.commands.executeCommand("editor.action.inlineSuggest.trigger").then(
-                        () => {},
-                        (e: any) => log(`[Provider] -> trigger failed: ${e}`),
-                    );
-                }
-            })
-            .catch((err) => {
-                this.inFlight.delete(contextKey);
-                log(`[Provider] -> backend error: ${err.message}`);
-            });
-
-        // Hold this request open until generation completes, so VS Code shows the
-        // ghost text as soon as it's ready (instead of waiting for the next keystroke).
-        return new Promise<vscode.InlineCompletionItem[]>((resolve) => {
-            this.pendingResolve = resolve;
-            this.pendingPosition = position;
-            this.pendingContextKey = contextKey;
+        log("[Provider] -> starting background generation" + (isIntent ? " (intent mode)" : ""));
+        return new Promise<vscode.CompletionItem[]>((resolve) => {
+            this.backend
+                .complete(
+                    contextData,
+                    undefined as unknown as vscode.CancellationToken,
+                    streamCb,
+                    isIntent ? 512 : undefined,
+                )
+                .then(() => {
+                    this.inFlight.delete(contextKey);
+                    const cleaned = cleanCompletion(accumulated, contextData.before, isIntent);
+                    if (cleaned) {
+                        this.completions.set(contextKey, cleaned);
+                        log(`[Provider] -> cached completion (${cleaned.length} chars)`);
+                        log(`[Provider] -> CLEANED TEXT: ${JSON.stringify(cleaned)}`);
+                        resolve([this.toCompletionItem(cleaned, document, position)]);
+                    } else {
+                        log("[Provider] -> empty completion, not caching");
+                        resolve([]);
+                    }
+                })
+                .catch((err) => {
+                    this.inFlight.delete(contextKey);
+                    log(`[Provider] -> backend error: ${err.message}`);
+                    resolve([]);
+                });
         });
     }
 
@@ -200,7 +201,7 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
  * and to echo the code already present before the cursor. We strip the fences
  * and remove any leading text that duplicates what's already at the cursor.
  */
-function cleanCompletion(raw: string, before: string): string {
+function cleanCompletion(raw: string, before: string, isIntent = false): string {
     let text = raw;
 
     // Stop generation at the end-of-text marker.
@@ -224,36 +225,45 @@ function cleanCompletion(raw: string, before: string): string {
     // Remove a stray leading '>' left over from FIM markers.
     text = text.replace(/^>\s*/, "");
 
-    // The model echoes the line already before the cursor. Strip a leading
-    // prefix that matches the tail of `before` (typically the current line).
+    // The model echoes the code already before the cursor. Strip any leading
+    // text that duplicates the current line's prefix (e.g. you typed
+    // "const c" and the model emits "const d = ..." -> drop the echoed "const ").
     const beforeLines = before.split("\n");
     const lastBeforeLine = beforeLines[beforeLines.length - 1];
-    if (lastBeforeLine && text.startsWith(lastBeforeLine)) {
-        text = text.slice(lastBeforeLine.length);
-    }
-
-    // If it still starts by repeating the whole `before` tail more broadly,
-    // remove a leading segment equal to the cursor-line prefix.
     const cursorPrefix = lastBeforeLine.trimStart();
     if (cursorPrefix && text.startsWith(cursorPrefix)) {
         text = text.slice(cursorPrefix.length);
     }
-
-    // Stop at the first blank-line-delimited repetition (model loops).
-    const lines = text.split("\n");
-    const seen = new Set<string>();
-    const out: string[] = [];
-    for (const ln of lines) {
-        const key = ln.trim();
-        if (key && seen.has(key) && out.length > 0) {
-            break;
-        }
-        if (key) {
-            seen.add(key);
-        }
-        out.push(ln);
+    // Drop any leftover indentation from the stripped prefix.
+    if (!isIntent) {
+        text = text.replace(/^\s+/, "");
     }
-    text = out.join("\n");
+
+    // Stop at the first blank line: for inline (mid-line) completion we only
+    // want the immediate continuation, not a whole function body + examples.
+    // For intent mode we keep the full generated implementation.
+    if (!isIntent) {
+        const firstBlank = text.search(/\n\s*\n/);
+        if (firstBlank !== -1) {
+            text = text.slice(0, firstBlank);
+        }
+
+        // Drop runaway repetition (model loops on example outputs).
+        const lines = text.split("\n");
+        const seen = new Set<string>();
+        const out: string[] = [];
+        for (const ln of lines) {
+            const key = ln.trim();
+            if (key && seen.has(key) && out.length > 0) {
+                break;
+            }
+            if (key) {
+                seen.add(key);
+            }
+            out.push(ln);
+        }
+        text = out.join("\n");
+    }
 
     text = text.replace(/\s+$/, "");
     return text;
