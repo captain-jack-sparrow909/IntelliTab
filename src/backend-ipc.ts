@@ -323,17 +323,22 @@ export class BackendIPC {
                 this.streamTokens.set(id, onToken);
             }
 
-             // Listen for cancellation
-            const onCancel = token.onCancellationRequested(() => {
-                onCancel.dispose();
-                this.send({ type: "cancel", id });
-                const pending = this.pendingRequests.get(id);
-                if (pending) {
-                    pending.reject(new Error("Cancelled by user"));
-                    this.pendingRequests.delete(id);
-                }
-                this.streamTokens.delete(id);
-            });
+             // Listen for cancellation only if a token was provided. When no
+             // token is given the generation runs to completion independently of
+             // any single request's lifecycle (used by the inline provider, which
+             // is cancelled aggressively by VS Code).
+            if (token) {
+                const onCancel = token.onCancellationRequested(() => {
+                    onCancel.dispose();
+                    this.send({ type: "cancel", id });
+                    const pending = this.pendingRequests.get(id);
+                    if (pending) {
+                        pending.reject(new Error("Cancelled by user"));
+                        this.pendingRequests.delete(id);
+                    }
+                    this.streamTokens.delete(id);
+                });
+            }
 
              // Send the request
             this.send(request as unknown as Record<string, unknown>);

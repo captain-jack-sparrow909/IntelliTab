@@ -17,10 +17,10 @@ from mlx_lm import generate, load, stream_generate
 from mlx_lm.sample_utils import make_sampler
 
 
-# FIM tokens for Qwen2.5-Coder
-FIM_PREFIX = "<fim_prefix>"
-FIM_SUFFIX = "<fim_suffix>"
-FIM_MIDDLE = "<fim_middle>"
+# FIM tokens for Qwen2.5-Coder (uses the <|fim_*|> special tokens)
+FIM_BEGIN = "<|fim_begin|>"
+FIM_END = "<|fim_end|>"
+FIM_PAD = "<|fim_pad|>"
 
 # Mapping from quantization name to MLX model_config
 QUANT_CONFIG = {
@@ -93,12 +93,12 @@ class ModelEngine:
         self.sampler = make_sampler(temp=temperature, top_p=1.0)
 
     def build_fim_prompt(self, before: str, after: str) -> str:
-        """Build a FIM (Fill-in-the-Middle) prompt.
+        """Build a FIM (Fill-in-the-Middle) prompt for Qwen2.5-Coder.
 
-        Qwen2.5-Coder FIM format:
-            <fim_prefix>{before}<fim_suffix>{after}<fim_middle>
+        Format expected by the model's FIM training:
+            <|fim_begin|>{prefix}<|fim_end|>{suffix}<|fim_begin|><|fim_pad|><|fim_end|>{middle}
         """
-        return f"{FIM_PREFIX}\n{before}{FIM_SUFFIX}\n{after}{FIM_MIDDLE}"
+        return f"{FIM_BEGIN}{before}{FIM_END}{after}{FIM_BEGIN}{FIM_PAD}{FIM_END}"
 
     def generate(
         self,

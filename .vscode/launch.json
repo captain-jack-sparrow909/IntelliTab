@@ -3,22 +3,21 @@
      "configurations": [
          {
              "name": "Run Extension",
-             "type": "extensionHost",
-             "request": "launch",
-             "runtime": "code",
-             "args": [
-                  "--extensionDevelopmentPath",
-                  "${workspaceFolder}"
-             ],
+              "type": "extensionHost",
+              "request": "launch",
+              "runtime": "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+              "env": {
+                   "PATH": "/Users/jabirkhan/.local/bin:/usr/local/bin:/usr/bin:/bin"
+              },
+              "args": [
+                   "--extensionDevelopmentPath",
+                   "${workspaceFolder}",
+                   "${workspaceFolder}"
+              ],
              "outFiles": [
                   "${workspaceFolder}/out/**/*.js"
              ],
-             "preLaunchTask": {
-                  "type": "shell",
-                  "command": "npm",
-                  "args": ["run", "compile"],
-                  "problemMatcher": ["$tsc"]
-             }
+              "preLaunchTask": "npm: compile"
          }
      ]
 }
