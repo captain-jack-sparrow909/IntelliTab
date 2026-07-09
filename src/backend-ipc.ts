@@ -19,6 +19,7 @@ export interface CompleteRequest {
         after: string;
         language: string;
         intent?: string;
+        mode?: "fim" | "intent";
     };
     max_tokens?: number;
     streaming?: boolean;
@@ -321,19 +322,30 @@ export class BackendIPC {
     }
 
     complete(
-        context: { before: string; after: string; language: string; intent?: string },
+        context: {
+            before: string;
+            after: string;
+            language: string;
+            intent?: string;
+            mode?: "fim" | "intent";
+        },
         onToken?: TokenCallback,
         options?: {
             maxTokens?: number;
             stopOnNewline?: boolean;
+            /** Cancel in-flight job first (default true). Set false when joining. */
+            cancelPrevious?: boolean;
         },
     ): Promise<string> {
         if (!this.process?.stdin) {
             throw new Error("Backend process not started");
         }
 
-        // Drop the previous request — critical for interactive typing speed.
-        this.cancelActive();
+        // Only cancel when the caller is starting a *new* context.
+        // Blind cancel-on-every-call caused thrash + multi-second delays.
+        if (options?.cancelPrevious !== false) {
+            this.cancelActive();
+        }
 
         const id = this.nextId++;
         this.activeCompleteId = id;

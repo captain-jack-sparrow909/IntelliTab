@@ -14,23 +14,25 @@ let outputChannel: vscode.OutputChannel | null = null;
 export function activate(context: vscode.ExtensionContext): void {
     outputChannel = vscode.window.createOutputChannel("MLX Code Completion");
     setLogger((msg: string) => outputChannel!.appendLine(msg));
-    outputChannel.appendLine("[MLX] Extension activated (latency mode)");
+    outputChannel.appendLine("[MLX] Extension activated (Phase A: FIM + adaptive context)");
 
     const editorConfig = vscode.workspace.getConfiguration("editor");
     void editorConfig.update("inlineSuggest.enabled", true, vscode.ConfigurationTarget.Global);
 
     const config = vscode.workspace.getConfiguration("mlxCompletion");
-    const modelPath = config.get<string>("modelPath") || "";
+    const modelPath = resolveModelPath(config.get<string>("modelPath") || "");
     const quantization = config.get<string>("quantization") || "4bit";
-    const debounceMs = Math.max(20, config.get<number>("debounceMs") || 40);
-    const maxTokens = config.get<number>("maxTokens") || 32;
-    const contextLinesBefore = config.get<number>("contextLinesBefore") || 60;
-    const contextLinesAfter = config.get<number>("contextLinesAfter") || 15;
+    // Slightly longer debounce avoids cancel-thrash while typing quickly.
+    const debounceMs = Math.max(40, config.get<number>("debounceMs") || 75);
+    const maxTokens = config.get<number>("maxTokens") || 40;
+    // Upper bounds — adaptive extractor uses less for FIM, more for intent.
+    const contextLinesBefore = config.get<number>("contextLinesBefore") || 80;
+    const contextLinesAfter = config.get<number>("contextLinesAfter") || 20;
 
     outputChannel.appendLine(
-        `[MLX] model=${modelPath || "(default)"} quant=${quantization} ` +
+        `[MLX] model=${modelPath || "(server default)"} quant=${quantization} ` +
             `debounce=${debounceMs}ms maxTok=${maxTokens} ` +
-            `ctx=${contextLinesBefore}/${contextLinesAfter}`,
+            `ctxCap=${contextLinesBefore}/${contextLinesAfter}`,
     );
 
     const serverScript = path.join(context.extensionPath, "python-server", "server.py");
@@ -143,4 +145,30 @@ export function deactivate(): void {
     backend = null;
     outputChannel?.dispose();
     outputChannel = null;
+}
+
+/**
+ * Resolve model path: user setting → Phase A defaults on disk.
+ * Empty string lets the Python server run its own fallback chain.
+ */
+function resolveModelPath(configured: string): string {
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    // Quality first: 7B Instruct (if present) > 3B base FIM > 3B Instruct.
+    // 3B base alone often maps `sub` → `a + b` without enough signal; 7B is better.
+    const candidates = [
+        configured,
+        path.join(home, ".mlx-models", "Qwen2.5-Coder-7B-Instruct-MLX-4bit"),
+        path.join(home, ".mlx-models", "Qwen2.5-Coder-3B-4bit"),
+        path.join(home, ".mlx-models", "Qwen2.5-Coder-3B-Instruct-MLX-4bit"),
+    ].filter(Boolean);
+
+    for (const c of candidates) {
+        const expanded = c.startsWith("~")
+            ? path.join(home, c.slice(1))
+            : c;
+        if (fs.existsSync(path.join(expanded, "config.json"))) {
+            return expanded;
+        }
+    }
+    return configured || path.join(home, ".mlx-models", "Qwen2.5-Coder-3B-4bit");
 }

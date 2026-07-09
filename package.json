@@ -26,35 +26,35 @@
         "mlxCompletion.modelPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the MLX model directory (e.g., ~/mlx-models/Qwen2.5-Coder-3B-Instruct-MLX-4bit)"
+          "description": "Path to MLX model dir. Empty = auto (prefers ~/.mlx-models/Qwen2.5-Coder-3B-4bit base FIM model)."
         },
         "mlxCompletion.quantization": {
           "type": "string",
           "enum": ["4bit", "8bit", "BF16"],
           "default": "4bit",
-          "description": "Quantization level for the MLX model"
+          "description": "Quantization level (only applied if the checkpoint is not already quantized)"
         },
         "mlxCompletion.debounceMs": {
           "type": "number",
-          "default": 40,
-          "minimum": 20,
+          "default": 75,
+          "minimum": 40,
           "maximum": 200,
-          "description": "Debounce delay in milliseconds before requesting a completion (20-200). Lower = snappier, more model load."
+          "description": "Debounce before requesting a completion (40-200ms). Too low causes cancel thrash."
         },
         "mlxCompletion.maxTokens": {
           "type": "number",
-          "default": 32,
-          "description": "Maximum tokens per normal completion (intent mode uses more). Lower = faster."
+          "default": 40,
+          "description": "Max tokens for FIM/mid-line completions (intent mode uses 96–160)."
         },
         "mlxCompletion.contextLinesBefore": {
           "type": "number",
-          "default": 60,
-          "description": "Lines before cursor to include. Lower = faster prefill."
+          "default": 80,
+          "description": "Upper bound on lines before cursor. Adaptive context uses less for FIM, more for intent."
         },
         "mlxCompletion.contextLinesAfter": {
           "type": "number",
-          "default": 15,
-          "description": "Lines after cursor to include. Lower = faster prefill."
+          "default": 20,
+          "description": "Upper bound on lines after cursor. Adaptive context scales by mode."
         },
         "mlxCompletion.temperature": {
           "type": "number",
@@ -70,7 +70,9 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts"
+    "lint": "eslint src --ext ts",
+    "test:bench": "python3 tests/bench_completion.py",
+    "test:unit": "python3 tests/bench_completion.py --unit-only"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
