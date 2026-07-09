@@ -141,7 +141,7 @@ def compose(line_before: str, prep: Prepared) -> str:
 
 
 def detect_intent(line_before: str, prev_line: str = "", at_blank: bool = False) -> Optional[str]:
-    """Port of narrowed detectIntent for single-line cases used in benches."""
+    """Port of detectIntent: comments + Python def only (brace bodies → multi-line FIM)."""
     m = re.search(r"(?://|#|\"\"\"|'''|/\*)\s*(.+?)\s*$", line_before)
     if m and len(m.group(1)) >= 3:
         return m.group(1)
@@ -149,14 +149,9 @@ def detect_intent(line_before: str, prev_line: str = "", at_blank: bool = False)
         m2 = re.search(r"(?://|#)\s*(.+?)\s*$", prev_line)
         if m2 and len(m2.group(1)) >= 3:
             return m2.group(1)
-    block = re.search(
-        r"(?:function\s+[\w$]+\s*\([^)]*\)\s*\{\s*$|"
-        r"def\s+[\w$]+\s*\([^)]*\)\s*:\s*$|"
-        r"(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?\([^)]*\)\s*(?:=>|->)\s*\{\s*$|"
-        r"[\w$]+\s*\([^)]*\)\s*(?:=>|->)\s*\{\s*$)",
-        line_before,
-    )
-    if block:
+    # Python colon-style only — JS/TS empty bodies use multi-line FIM in the extension.
+    py = re.search(r"def\s+[\w$]+\s*\([^)]*\)\s*:\s*$", line_before)
+    if py:
         return f"Implement the body of:\n{line_before.strip()}"
     return None
 
@@ -398,8 +393,9 @@ def run_unit_insert_tests() -> tuple[int, int]:
     print("\n=== UNIT: intent classification ===")
     intent_cases = [
         ("const sub = (a, b) => ", False),
-        ("const sub = (a, b) => {", True),
-        ("function subtract(a, b) {", True),
+        # Brace openers are multi-line FIM now, not chat intent.
+        ("const sub = (a, b) => {", False),
+        ("function subtract(a, b) {", False),
         ("def sub(a, b):", True),
         ("const add = (a, b) => a + ", False),
     ]
@@ -534,6 +530,17 @@ def run_model_scenario(engine: ModelEngine, sc: Scenario) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="", help="Model path override")
+    ap.add_argument(
+        "--draft-model",
+        default=None,
+        help="Draft model path (Phase D). Omit for auto; empty string disables.",
+    )
+    ap.add_argument(
+        "--no-speculative",
+        action="store_true",
+        help="Disable speculative decoding",
+    )
+    ap.add_argument("--num-draft-tokens", type=int, default=3)
     ap.add_argument("--unit-only", action="store_true")
     args = ap.parse_args()
 
@@ -544,13 +551,32 @@ def main() -> int:
         return 1 if u_fail else 0
 
     model_path = resolve_model_path(args.model or None)
+    speculative = not args.no_speculative
+    draft_path = args.draft_model
+    if draft_path is not None and draft_path.strip() == "":
+        speculative = False
+        draft_path = ""
+
     print(f"\n=== MODEL: loading {model_path} ===")
+    print(
+        f"speculative={speculative} draft={draft_path if draft_path is not None else '(auto)'} "
+        f"num_draft={args.num_draft_tokens}"
+    )
     t_load = time.perf_counter()
-    engine = ModelEngine(model_path=model_path, max_tokens=32, temperature=0.0)
+    engine = ModelEngine(
+        model_path=model_path,
+        max_tokens=32,
+        temperature=0.0,
+        draft_model_path=draft_path,
+        speculative=speculative,
+        num_draft_tokens=args.num_draft_tokens,
+    )
     print(f"Load time: {(time.perf_counter() - t_load) * 1000:.0f}ms")
     print(
         f"fim={engine._has_fim} chat={engine._has_chat} "
-        f"instruct={engine._is_instruct}"
+        f"instruct={engine._is_instruct} "
+        f"spec={'yes' if engine.draft_model is not None else 'no'} "
+        f"draft={engine.draft_model_path or '-'}"
     )
 
     # Warmup

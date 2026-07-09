@@ -20,6 +20,7 @@ export interface CompleteRequest {
         language: string;
         intent?: string;
         mode?: "fim" | "intent";
+        multiLine?: boolean;
     };
     max_tokens?: number;
     streaming?: boolean;
@@ -76,6 +77,15 @@ export function encodeMessage(data: Record<string, unknown>): Buffer {
     return Buffer.concat([prefix, bodyBytes]);
 }
 
+export interface SpeculativeOptions {
+    /** Enable speculative decoding (default true). */
+    enabled?: boolean;
+    /** Path to draft model; empty string disables; omit for auto-pick. */
+    draftModelPath?: string;
+    /** Draft tokens per verification step (1–8). */
+    numDraftTokens?: number;
+}
+
 export class BackendIPC {
     private process: ChildProcess | null = null;
     private nextId = 1;
@@ -94,6 +104,7 @@ export class BackendIPC {
     private outputChannel: vscode.OutputChannel | null;
     /** Most recent completion request id — cancelled when a newer one starts. */
     private activeCompleteId: number | null = null;
+    private speculative: SpeculativeOptions;
 
     constructor(
         private serverScript: string,
@@ -102,8 +113,10 @@ export class BackendIPC {
         private maxTokens: number,
         private temperature: number,
         outputChannel: vscode.OutputChannel | null = null,
+        speculative: SpeculativeOptions = {},
     ) {
         this.outputChannel = outputChannel;
+        this.speculative = speculative;
     }
 
     private log(msg: string): void {
@@ -127,6 +140,23 @@ export class BackendIPC {
         }
         if (this.temperature !== undefined) {
             args.push("--temperature", String(this.temperature));
+        }
+
+        // Phase D: speculative decoding
+        if (this.speculative.enabled === false) {
+            args.push("--no-speculative");
+        } else if (
+            this.speculative.draftModelPath !== undefined &&
+            this.speculative.draftModelPath !== ""
+        ) {
+            args.push("--draft-model", this.speculative.draftModelPath);
+        }
+        // Omit --draft-model entirely for auto-pick when enabled.
+        if (
+            this.speculative.numDraftTokens !== undefined &&
+            this.speculative.numDraftTokens > 0
+        ) {
+            args.push("--num-draft-tokens", String(this.speculative.numDraftTokens));
         }
 
         this.process = spawn(pythonPath, args, {
@@ -328,6 +358,7 @@ export class BackendIPC {
             language: string;
             intent?: string;
             mode?: "fim" | "intent";
+            multiLine?: boolean;
         },
         onToken?: TokenCallback,
         options?: {

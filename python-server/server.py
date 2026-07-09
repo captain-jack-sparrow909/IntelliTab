@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-MLX Code Completion Server — Phase A (FIM-first, dual policy).
+MLX Code Completion Server — Phases A–D.
 
 - Model stays loaded
 - stdin reader thread so cancel can interrupt generation
 - mode=fim (mid-line) vs mode=intent (comment/signature/empty body)
+- Phase C: prefix KV cache
+- Phase D: speculative decoding (optional draft model)
 """
 
 from __future__ import annotations
@@ -54,6 +56,8 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
     t0 = time.perf_counter()
     try:
         stop_when_balanced = False
+        stop_on_derail = False
+        multi_line = False
         if is_intent:
             prompt = engine.build_intent_prompt(
                 context.get("intent") or "Implement the code",
@@ -62,10 +66,11 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
             )
             # Multi-line bodies: enough tokens to finish. Early-stop is conservative
             # (single guard if/return must NOT end generation — deepEqual/clone etc.).
-            max_tokens = max(max_tokens, 140)
-            max_tokens = min(max_tokens, 220)
+            max_tokens = max(max_tokens, 120)
+            max_tokens = min(max_tokens, 180)
             stop_on_newline = False
             stop_when_balanced = True
+            stop_on_derail = True
             mode = "intent"
         else:
             prompt = engine.build_fim_prompt(
@@ -73,11 +78,36 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
                 context.get("after", ""),
                 language=language,
             )
-            # One line is enough for mid-line FIM.
-            max_tokens = max(16, min(max_tokens, 32))
-            if "stop_on_newline" not in msg and "stopOnNewline" not in msg:
-                stop_on_newline = True
-            mode = "fim"
+            # Multi-line FIM: continuing an open block (after `{`, partial body).
+            # Extension sets stop_on_newline=false + higher max_tokens.
+            multi_line = (
+                bool(context.get("multiLine") or context.get("multi_line"))
+                or (
+                    "stop_on_newline" in msg
+                    and not bool(msg.get("stop_on_newline"))
+                )
+                or (
+                    "stopOnNewline" in msg
+                    and not bool(msg.get("stopOnNewline"))
+                )
+            )
+            if multi_line:
+                # Cap decode: long multi-line is where models invent prose / next fns.
+                max_tokens = max(max_tokens, 48)
+                max_tokens = min(max_tokens, 96)
+                stop_on_newline = False
+                # Do NOT use stop_when_balanced: generated text often closes
+                # braces that were opened in the prefix (`if (...) { |`), so
+                # balance checks misfire and cut after one return.
+                stop_when_balanced = False
+                stop_on_derail = True
+                mode = "fim+ml"
+            else:
+                # One line is enough for mid-expression FIM.
+                max_tokens = max(16, min(max_tokens, 32))
+                if "stop_on_newline" not in msg and "stopOnNewline" not in msg:
+                    stop_on_newline = True
+                mode = "fim"
 
         prompt_chars = len(prompt)
         if use_streaming:
@@ -89,6 +119,7 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
                 msg_id=msg_id,
                 stop_on_newline=stop_on_newline,
                 stop_when_balanced=stop_when_balanced,
+                stop_on_derail=stop_on_derail,
             ):
                 if token:
                     if first_token_ms is None:
@@ -142,21 +173,56 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--streaming", action="store_true", default=True)
+    # Phase D: speculative decoding
+    parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help="Path to smaller draft model. Empty string disables. Default: auto-pick smaller sibling.",
+    )
+    parser.add_argument(
+        "--no-speculative",
+        action="store_true",
+        help="Disable speculative decoding even if a draft model is available.",
+    )
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=3,
+        help="Draft tokens per verification step (1–8, default 3).",
+    )
     args = parser.parse_args()
 
     model_path = resolve_model_path(args.model or None)
     sys.stderr.write(f"[server] Using model: {model_path}\n")
     sys.stderr.flush()
 
+    # --draft-model "" means disable; omit flag means auto.
+    draft_explicit = args.draft_model  # None = auto, "" = off, path = use
+    speculative = not args.no_speculative
+    if draft_explicit is not None and draft_explicit.strip() == "":
+        speculative = False
+        draft_explicit = ""
+
     engine = ModelEngine(
         model_path=model_path,
         quantization=args.quantization,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        draft_model_path=draft_explicit,
+        speculative=speculative,
+        num_draft_tokens=args.num_draft_tokens,
     )
 
     write = message_writer()
-    write(encode_message({"type": "ready", "model": model_path}))
+    ready = {
+        "type": "ready",
+        "model": model_path,
+        "speculative": engine.draft_model is not None,
+        "draft_model": engine.draft_model_path or "",
+        "num_draft_tokens": engine.num_draft_tokens if engine.draft_model else 0,
+    }
+    write(encode_message(ready))
     sys.stderr.flush()
 
     q: queue.Queue = queue.Queue()

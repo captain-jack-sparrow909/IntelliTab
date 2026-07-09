@@ -85,14 +85,18 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
             intent,
         );
         const isIntent = contextData.mode === "intent";
+        const multiLine = !!contextData.multiLine;
         const linePrefix = document
             .lineAt(position.line)
             .text.substring(0, position.character);
 
         // Intent keys ignore whitespace-only prefix so indent typing doesn't restart.
+        // Multi-line FIM: key on line+depth so typing inside the same block can join.
         const contextKey = isIntent
             ? `i:${intent}:${position.line}`
-            : `f:${linePrefix}|${hashShort(contextData.after)}|${position.line}:${position.character}`;
+            : multiLine
+              ? `m:${position.line}:${linePrefix.trimEnd()}|${hashShort(contextData.before.slice(-200))}`
+              : `f:${linePrefix}|${hashShort(contextData.after)}|${position.line}:${position.character}`;
 
         const cached = this.completions.get(contextKey);
         if (cached) {
@@ -100,12 +104,13 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
         }
 
         // Join in-flight work for the same key.
+        const waitMs = isIntent || multiLine ? 3500 : 800;
         if (this.activeGen && this.activeGen.contextKey === contextKey) {
-            const joined = await waitUntilDone(this.activeGen, isIntent ? 3500 : 800);
+            const joined = await waitUntilDone(this.activeGen, waitMs);
             return joined ? this.toInlineItems(joined) : null;
         }
 
-        // Protect in-flight INTENT: do not cancel mid-body generation.
+        // Protect in-flight INTENT / multi-line body: do not cancel mid-generation.
         if (this.activeGen && !this.activeGen.done && this.activeGen.isIntent) {
             if (isIntent && intent && intent === this.activeGen.intentText) {
                 const joined = await waitUntilDone(this.activeGen, 3500);
@@ -125,6 +130,14 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
                 if (joined && isIntent) {
                     return this.toInlineItems(joined);
                 }
+            } else if (multiLine && !this.activeGen.done) {
+                // Don't thrash multi-line FIM on tiny cursor jitter.
+                const joined = await waitUntilDone(this.activeGen, 2000);
+                if (joined && this.activeGen.contextKey === contextKey) {
+                    return this.toInlineItems(joined);
+                }
+                this.backend.cancelActive();
+                this.activeGen = null;
             } else {
                 this.backend.cancelActive();
                 this.activeGen = null;
@@ -134,6 +147,7 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
         const gen = this.startGeneration(
             contextData,
             isIntent,
+            multiLine,
             document,
             position,
             linePrefix,
@@ -142,9 +156,9 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
         );
         this.activeGen = gen;
 
-        const result = await waitUntilDone(gen, isIntent ? 3500 : 800);
+        const result = await waitUntilDone(gen, waitMs);
         log(
-            `[Provider] mode=${contextData.mode} ` +
+            `[Provider] mode=${contextData.mode}${multiLine ? "+ml" : ""} ` +
                 `out=${result ? JSON.stringify(result.text.slice(0, 80)) : "null"} ` +
                 `${Date.now() - t0}ms`,
         );
@@ -154,6 +168,7 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
     private startGeneration(
         contextData: DocumentContext,
         isIntent: boolean,
+        multiLine: boolean,
         document: vscode.TextDocument,
         position: vscode.Position,
         linePrefix: string,
@@ -173,11 +188,13 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
         let firstTokenAt = 0;
         let accumulated = "";
 
-        const stopOnNewline = !isIntent;
-        // FIM: short decode. Intent: enough for a full body; server early-stops when balanced.
+        // Intent / block-continue: multi-line. Mid-expression FIM: one line.
+        const stopOnNewline = !isIntent && !multiLine;
         const maxTok = isIntent
             ? Math.min(160, Math.max(this.maxTokens, 96))
-            : Math.max(16, Math.min(28, this.maxTokens || 28));
+            : multiLine
+              ? Math.min(96, Math.max(this.maxTokens, 48))
+              : Math.max(16, Math.min(28, this.maxTokens || 28));
 
         const prepare = (raw: string): PreparedCompletion | null => {
             let cleaned = cleanRaw(raw);
@@ -185,37 +202,101 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
                 return null;
             }
 
-            if (isIntent) {
+            if (isIntent || multiLine) {
                 cleaned = refineBodyInsert(cleaned, contextData.before, linePrefix);
+                // Salvage first: cut prose / brace spam / invented next fns
+                // before formatting so we don't polish garbage.
+                cleaned = salvageCodeCompletion(
+                    cleaned,
+                    contextData.after || "",
+                    multiLine,
+                );
                 cleaned = finishIncompleteBlock(cleaned);
                 cleaned = fixUnreachableElseAfterReturn(cleaned);
             }
             // Cheap whitespace-only formatting (no model cost): break packed statements.
             cleaned = formatStatementNewlines(cleaned);
-            if (isIntent || cleaned.includes("\n")) {
+            if (isIntent || multiLine || cleaned.includes("\n")) {
                 cleaned = normalizeIndentation(cleaned, document, position);
             }
 
-            const prepared = toInsert(cleaned, linePrefix, document, position, isIntent);
+            if (!cleaned.trim() || isStructurallyBroken(cleaned)) {
+                log(
+                    `[Provider] reject broken structure: ${JSON.stringify(
+                        cleaned.slice(0, 100),
+                    )}`,
+                );
+                return null;
+            }
+
+            const prepared = toInsert(
+                cleaned,
+                linePrefix,
+                document,
+                position,
+                isIntent,
+                multiLine,
+            );
             if (!prepared || !prepared.text) {
                 return null;
             }
             // Format again after insert shaping (range/body only) if still packed.
             let finalText = formatStatementNewlines(prepared.text);
-            if (finalText.includes("\n") || isIntent) {
+            if (finalText.includes("\n") || isIntent || multiLine) {
                 finalText = normalizeIndentation(finalText, document, position);
+            }
+            // Final salvage pass after indent normalize
+            if (isIntent || multiLine) {
+                finalText = salvageCodeCompletion(
+                    finalText,
+                    contextData.after || "",
+                    multiLine,
+                );
             }
             const formatted: PreparedCompletion = { text: finalText, range: prepared.range };
 
-            if (isLowQuality(formatted.text, contextData, isIntent)) {
+            if (!formatted.text.trim() || isStructurallyBroken(formatted.text)) {
                 return null;
             }
-            if (isIntent && !isStructurallyComplete(formatted.text)) {
-                log(
-                    `[Provider] reject incomplete structure: ${JSON.stringify(
-                        formatted.text.slice(0, 80),
-                    )}`,
-                );
+            if (isLowQuality(formatted.text, contextData, isIntent || multiLine)) {
+                return null;
+            }
+            // Prefer a soft-closed or useful partial over showing nothing.
+            // (Strict completeness was rejecting salvage-cut bodies → empty UI.)
+            if ((isIntent || multiLine) && !isStructurallyComplete(formatted.text)) {
+                const soft = softCloseOpenBlocks(formatted.text);
+                if (
+                    soft !== formatted.text &&
+                    isStructurallyComplete(soft) &&
+                    !isStructurallyBroken(soft) &&
+                    !isLowQuality(soft, contextData, true)
+                ) {
+                    log(
+                        `[Provider] soft-closed partial: ${JSON.stringify(soft.slice(0, 80))}`,
+                    );
+                    return { text: soft, range: formatted.range };
+                }
+                if (isUsefulPartial(formatted.text)) {
+                    log(
+                        `[Provider] accept useful partial: ${JSON.stringify(
+                            formatted.text.slice(0, 80),
+                        )}`,
+                    );
+                    return formatted;
+                }
+                // Intent comment→code: still require completeness if partial is weak.
+                if (isIntent && !multiLine) {
+                    log(
+                        `[Provider] reject incomplete structure: ${JSON.stringify(
+                            formatted.text.slice(0, 80),
+                        )}`,
+                    );
+                    return null;
+                }
+                // Multi-line FIM: show partial only if not broken (already checked).
+                if (formatted.text.trim().length >= 12) {
+                    return formatted;
+                }
                 return null;
             }
             return formatted;
@@ -227,7 +308,11 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
             }
             if (!firstTokenAt) {
                 firstTokenAt = Date.now();
-                log(`[Provider] TTFT ${firstTokenAt - t0}ms mode=${contextData.mode}`);
+                log(
+                    `[Provider] TTFT ${firstTokenAt - t0}ms mode=${contextData.mode}${
+                        multiLine ? "+ml" : ""
+                    }`,
+                );
             }
             accumulated += tokenText;
         };
@@ -240,12 +325,13 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
                     language: contextData.language,
                     intent: contextData.intent,
                     mode: contextData.mode,
+                    multiLine: multiLine || undefined,
                 },
                 onToken,
                 {
                     maxTokens: maxTok,
                     stopOnNewline,
-                    // Intent: never cancel-previous at start of same-key join
+                    // Intent / multi-line: never cancel-previous at start of same-key join
                     cancelPrevious: false,
                 },
             )
@@ -355,6 +441,292 @@ function waitUntilDone(
             }
         }, 16);
     });
+}
+
+/**
+ * Cut / salvage multi-line completions that derail into prose, brace spam,
+ * invented next functions, or runaway indentation.
+ */
+function salvageCodeCompletion(
+    text: string,
+    after: string,
+    multiLine: boolean,
+): string {
+    let t = text;
+    if (!t) {
+        return t;
+    }
+
+    t = cutAtProse(t);
+    t = cutDuplicateStatementLines(t);
+    t = cutRunawayIndent(t);
+    t = cutMisindentedClosers(t);
+    t = cutBraceCloseSpam(t);
+
+    if (multiLine || after) {
+        t = trimMultiLineContinue(t, after);
+    }
+
+    // Drop trailing blank lines / half-open tails.
+    t = t.replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n").replace(/\s+$/, "");
+    return t;
+}
+
+/** True when a line is natural-language explanation rather than code. */
+function isProseLine(line: string): boolean {
+    const t = line.trim();
+    if (!t || t.length < 12) {
+        return false;
+    }
+    if (
+        /^(const|let|var|function|async|await|return|if|else|for|while|switch|case|break|continue|try|catch|finally|throw|class|export|import|from|def|pass|yield|with|except|raise|new|this\.|super\.|public|private|protected|static|interface|type|enum|package|using|fn|func|impl|struct|match|loop|mut|pub)\b/.test(
+            t,
+        )
+    ) {
+        return false;
+    }
+    if ("{}()[];.,/*#`".includes(t[0])) {
+        return false;
+    }
+    if (/[{};=<>]|=>|::|\(\)/.test(t)) {
+        if (!/^(this|the|here|note|above|below|we|you|it|in)\b/i.test(t)) {
+            return false;
+        }
+    }
+    if (
+        /^(this|the|here|note|example|above|below|we |you |it |in this|the following|as you can|explanation|description)\b/i.test(
+            t,
+        )
+    ) {
+        return true;
+    }
+    if (
+        /\b(defines?|implements?|takes? a|parameter|method that|function that|class that|as input|as output|is called when)\b/i.test(
+            t,
+        ) &&
+        !/[{};=]/.test(t)
+    ) {
+        return true;
+    }
+    const words = t.split(/\s+/);
+    if (t.length > 55 && words.length >= 8 && !/[{};=<>()]/.test(t)) {
+        return true;
+    }
+    return false;
+}
+
+function cutAtProse(text: string): string {
+    const lines = text.split("\n");
+    const kept: string[] = [];
+    for (const line of lines) {
+        if (isProseLine(line)) {
+            break;
+        }
+        // Markdown fence / chat gloss mid-body
+        if (/^\s*```/.test(line) && kept.length > 0) {
+            break;
+        }
+        kept.push(line);
+    }
+    return kept.join("\n");
+}
+
+/** Drop consecutive duplicate statement lines (model loops). */
+function cutDuplicateStatementLines(text: string): string {
+    const lines = text.split("\n");
+    const out: string[] = [];
+    let prevCode: string | null = null;
+    for (const line of lines) {
+        const s = line.trim();
+        if (
+            s &&
+            prevCode !== null &&
+            s === prevCode &&
+            /[A-Za-z]/.test(s) &&
+            s.length > 8
+        ) {
+            // Skip this duplicate; if spam continues, later cuts handle it.
+            continue;
+        }
+        out.push(line);
+        if (s) {
+            prevCode = s;
+        }
+    }
+    return out.join("\n");
+}
+
+/** Stop when indentation explodes (model nesting collapse). */
+function cutRunawayIndent(text: string): string {
+    const lines = text.split("\n");
+    let base: number | null = null;
+    const out: string[] = [];
+    for (const line of lines) {
+        if (!line.trim()) {
+            out.push(line);
+            continue;
+        }
+        const ind = (line.match(/^[\t ]*/) || [""])[0].length;
+        if (base === null) {
+            base = ind;
+        }
+        // Tight cap: real code rarely jumps >4 levels past the first line.
+        if (ind > base + 16 || ind > 32) {
+            break;
+        }
+        out.push(line);
+    }
+    return out.join("\n");
+}
+
+/** Pure `}` / `};` line (not `});` or `} else`). */
+function isPureBraceClose(line: string): boolean {
+    return /^\s*\}[;,]?\s*$/.test(line);
+}
+
+/**
+ * Closing braces should not jump to a deeper indent than the previous
+ * code line — that's the classic "off the rails" nesting collapse.
+ */
+function cutMisindentedClosers(text: string): string {
+    const lines = text.split("\n");
+    const out: string[] = [];
+    let prevCodeInd = 0;
+    for (const line of lines) {
+        if (!line.trim()) {
+            out.push(line);
+            continue;
+        }
+        const ind = (line.match(/^[\t ]*/) || [""])[0].length;
+        if (isPureBraceClose(line) && out.length > 0 && ind > prevCodeInd) {
+            break;
+        }
+        out.push(line);
+        prevCodeInd = ind;
+    }
+    return out.join("\n");
+}
+
+/** Cut cascading pure-`}` lines once we've already closed the useful part. */
+function cutBraceCloseSpam(text: string): string {
+    const lines = text.split("\n");
+    const out: string[] = [];
+    let closeRun = 0;
+    for (const line of lines) {
+        // Only pure `}` / `};` — do NOT treat `});` or `} else` as spam.
+        if (isPureBraceClose(line)) {
+            closeRun++;
+            if (closeRun >= 3) {
+                // Keep at most 2 pure closers in a row from the model.
+                break;
+            }
+            out.push(line);
+            continue;
+        }
+        if (line.trim()) {
+            closeRun = 0;
+        }
+        out.push(line);
+    }
+    return out.join("\n");
+}
+
+/**
+ * Multi-line FIM cleanup: models often (1) re-emit the FIM suffix that is
+ * already in the file, then (2) invent a following function. Keep only the
+ * real insert at the cursor.
+ */
+function trimMultiLineContinue(text: string, after: string): string {
+    let t = text;
+    if (!t) {
+        return t;
+    }
+
+    // 1. If the FIM `after` appears inside the generation, cut from there.
+    const afterTrim = (after || "").replace(/^\r?\n/, "");
+    if (afterTrim.trim().length >= 6) {
+        const candidates = [
+            afterTrim,
+            afterTrim.trimStart(),
+            afterTrim
+                .split(/\r?\n/)
+                .filter((l) => l.trim())
+                .slice(0, 3)
+                .join("\n"),
+        ];
+        for (const needle of candidates) {
+            if (!needle || needle.length < 6) {
+                continue;
+            }
+            const idx = t.indexOf(needle);
+            if (idx >= 8) {
+                t = t.slice(0, idx);
+                break;
+            }
+        }
+    }
+
+    // 2. Cut before an invented following top-level declaration / class.
+    const decl = t.search(
+        /\n(?:export\s+)?(?:async\s+)?(?:function\s+\w|class\s+\w|const\s+\w+\s*=|let\s+\w+\s*=|var\s+\w+\s*=|def\s+\w)/,
+    );
+    if (decl > 20) {
+        const head = t.slice(0, decl);
+        if (braceBalance(head) <= 0) {
+            t = head;
+        }
+    }
+
+    t = t.replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n").replace(/\s+$/, "");
+    return t;
+}
+
+/**
+ * True when completion is structurally unusable (prefer show nothing over junk).
+ */
+function isStructurallyBroken(text: string): boolean {
+    const t = text.trim();
+    if (!t) {
+        return true;
+    }
+    if (isProseLine(t.split("\n")[0] || "")) {
+        return true;
+    }
+    // Any remaining prose line
+    if (t.split("\n").some((ln) => isProseLine(ln))) {
+        return true;
+    }
+    // Wild brace imbalance in the insert alone
+    const bal = braceBalance(t);
+    if (bal < -2 || bal > 5) {
+        return true;
+    }
+    // Mostly pure closing braces
+    const lines = t.split("\n").filter((l) => l.trim());
+    if (lines.length >= 3) {
+        const closeOnly = lines.filter((l) => isPureBraceClose(l)).length;
+        if (closeOnly / lines.length >= 0.4) {
+            return true;
+        }
+    }
+    // Runaway indent still present
+    const indents = lines.map((l) => (l.match(/^[\t ]*/) || [""])[0].length);
+    if (indents.length && Math.max(...indents) > 32) {
+        return true;
+    }
+    // Pure closer deeper than previous line (nesting collapse).
+    // Do NOT flag `} else if` or `});` — those continue with code punctuation.
+    for (let i = 1; i < lines.length; i++) {
+        if (!isPureBraceClose(lines[i])) {
+            continue;
+        }
+        const ind = (lines[i].match(/^[\t ]*/) || [""])[0].length;
+        const prev = (lines[i - 1].match(/^[\t ]*/) || [""])[0].length;
+        if (ind > prev) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -546,6 +918,80 @@ function isStructurallyComplete(text: string): boolean {
     return true;
 }
 
+/**
+ * Close a few trailing open braces/parens if the model was cut mid-body
+ * (derail-stop / max tokens). Conservative — only small positive balances.
+ */
+function softCloseOpenBlocks(text: string): string {
+    let t = text.replace(/\s+$/, "");
+    if (!t) {
+        return t;
+    }
+    // Don't close if clearly mid-expression
+    if (/[=+\-*/%,.(]\s*$/.test(t) || /\b(const|let|var|return|if|for|while)\s*$/.test(t)) {
+        return t;
+    }
+    let braces = braceBalance(t);
+    let parens = 0;
+    for (const ch of t) {
+        if (ch === "(") {
+            parens++;
+        } else if (ch === ")") {
+            parens--;
+        }
+    }
+    if (braces < 0 || braces > 3 || parens < 0 || parens > 3) {
+        return t;
+    }
+    if (braces === 0 && parens === 0) {
+        return t;
+    }
+    // Prefer closing after a finished statement
+    if (!/[;{})\]]\s*$/.test(t) && !/\breturn\b[^;]*$/.test(t)) {
+        return t;
+    }
+    const indent = (t.match(/\n([ \t]*)\S[^\n]*$/) || ["", "  "])[1];
+    const step = indent.startsWith("\t") ? "\t" : "  ";
+    while (parens > 0) {
+        t += ")";
+        parens--;
+    }
+    while (braces > 0) {
+        t += "\n" + step.repeat(Math.max(0, braces - 1)) + "}";
+        braces--;
+    }
+    return t;
+}
+
+/**
+ * Non-trivial partial body worth showing (better than empty ghost text).
+ */
+function isUsefulPartial(text: string): boolean {
+    const t = text.trim();
+    if (t.length < 16) {
+        return false;
+    }
+    if (isStructurallyBroken(t)) {
+        return false;
+    }
+    if (isProseLine(t.split("\n")[0] || "")) {
+        return false;
+    }
+    // At least one real statement keyword
+    if (!/\b(return|const|let|var|if|for|while|await|throw|try|switch|async)\b/.test(t)) {
+        return false;
+    }
+    const bal = braceBalance(t);
+    if (bal < -1 || bal > 4) {
+        return false;
+    }
+    // Not only a single open brace
+    if (/^\{\s*$/.test(t)) {
+        return false;
+    }
+    return true;
+}
+
 function normalizeIndentation(
     text: string,
     document: vscode.TextDocument,
@@ -595,10 +1041,12 @@ function toInsert(
     document: vscode.TextDocument,
     position: vscode.Position,
     isIntent: boolean,
+    multiLine: boolean = false,
 ): PreparedCompletion | null {
     let text = raw;
 
-    if (!isIntent) {
+    // Single-line FIM only: keep first line. Multi-line FIM / intent keep newlines.
+    if (!isIntent && !multiLine) {
         const nl = text.search(/\r?\n/);
         if (nl !== -1) {
             text = text.slice(0, nl);
@@ -610,8 +1058,8 @@ function toInsert(
         return null;
     }
 
-    // Intent multi-line: pure insert at cursor (indent already normalized)
-    if (isIntent) {
+    // Intent / multi-line FIM: pure insert at cursor (indent already normalized)
+    if (isIntent || multiLine) {
         // Never full-line rewrite intent bodies to col 0 with a new const
         if (
             lineBefore.trim().length === 0 &&
@@ -620,7 +1068,12 @@ function toInsert(
             // Signature already above empty body — strip wrapper again
             text = refineBodyInsert(text, document.getText(), lineBefore);
         }
-        text = text.replace(/^\n+/, "");
+        // After `{|` the model often emits a leading newline then the body.
+        if (/\{\s*$/.test(lineBefore) && text.startsWith("\n")) {
+            // keep the newline so the body lands on the next line
+        } else {
+            text = text.replace(/^\n+/, "");
+        }
         if (!text.trim()) {
             return null;
         }
@@ -749,6 +1202,15 @@ function isLowQuality(text: string, ctx: DocumentContext, isIntent: boolean): bo
         return true;
     }
     if (t.startsWith("```") || /^here('s| is)\b/i.test(t)) {
+        return true;
+    }
+    // Natural-language leakage (e.g. "This code defines a TaskQueue…")
+    if (t.split("\n").some((ln) => isProseLine(ln))) {
+        return true;
+    }
+    if (
+        /\b(this code defines|the following code|as you can see)\b/i.test(t)
+    ) {
         return true;
     }
     // Generic placeholders / stubs (not spread syntax `...x`)

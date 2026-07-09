@@ -19,12 +19,18 @@ export interface DocumentContext {
     intent?: string;
     /** Dual-policy mode for the backend. */
     mode: CompletionMode;
+    /**
+     * Multi-line FIM: continue an open block body (after `{`, empty line in
+     * incomplete function). Same FIM quality, but no stop-on-newline.
+     */
+    multiLine?: boolean;
     /** Debug / metrics. */
     meta?: {
         linesBefore: number;
         linesAfter: number;
         usedImports: boolean;
         usedScope: boolean;
+        multiLine?: boolean;
     };
 }
 
@@ -63,23 +69,29 @@ export function extractContext(
 ): DocumentContext {
     const isIntent = !!intent;
     const mode: CompletionMode = isIntent ? "intent" : "fim";
+    // Inside a partial function body (e.g. after `if (...) {`) → multi-line FIM.
+    const multiLine = !isIntent && isMultiLineContinueSite(document, position);
 
     // Adaptive line counts — never exceed user max settings.
     let linesBefore = isIntent
         ? Math.min(maxBefore, budgets.intentBefore)
-        : Math.min(maxBefore, budgets.fimBefore);
+        : multiLine
+          ? Math.min(maxBefore, Math.max(budgets.fimBefore, 55))
+          : Math.min(maxBefore, budgets.fimBefore);
     let linesAfter = isIntent
         ? Math.min(maxAfter, budgets.intentAfter)
-        : Math.min(maxAfter, budgets.fimAfter);
+        : multiLine
+          ? Math.min(maxAfter, Math.max(budgets.fimAfter, 12))
+          : Math.min(maxAfter, budgets.fimAfter);
 
     // Mid-identifier (e.g. `obj.fooBa|`) → tighter window, faster prefill.
-    if (!isIntent && isMidIdentifier(document, position)) {
+    if (!isIntent && !multiLine && isMidIdentifier(document, position)) {
         linesBefore = Math.min(linesBefore, 30);
         linesAfter = Math.min(linesAfter, 8);
     }
 
     // After `.` `(` → slightly more local context for member/call completion.
-    if (!isIntent && isAfterTriggerChar(document, position)) {
+    if (!isIntent && !multiLine && isAfterTriggerChar(document, position)) {
         linesBefore = Math.min(Math.max(linesBefore, 40), maxBefore);
     }
 
@@ -141,8 +153,8 @@ export function extractContext(
     }
 
     // Hard character caps (prefill insurance).
-    before = truncateEnd(before, isIntent ? 4500 : 3200);
-    after = truncateStart(after, isIntent ? 1200 : 600);
+    before = truncateEnd(before, isIntent || multiLine ? 4500 : 3200);
+    after = truncateStart(after, isIntent || multiLine ? 1200 : 600);
 
     return {
         before,
@@ -150,21 +162,151 @@ export function extractContext(
         language: document.languageId,
         intent,
         mode,
+        multiLine,
         meta: {
             linesBefore: position.line - prefixStart,
             linesAfter: endLine - position.line,
             usedImports,
             usedScope,
+            multiLine,
         },
     };
 }
 
 /**
- * Detect Copilot-style intent: comment→code or empty block body.
+ * Multi-line FIM sites: user is continuing an open block, not finishing one
+ * mid-line expression.
  *
- * Mid-line expression (`=> |`) stays FIM; block openers / empty bodies use intent.
- * Multi-line comment blocks are collected in full (not just the last line),
- * so a stack of `#` / `//` requirements reaches the model intact.
+ * Examples that SHOULD multi-line:
+ *   if (nums[mid] === target) {|
+ *   while (...) {\n  |
+ *   (blank / indent-only line inside an unclosed function body)
+ *
+ * Examples that stay single-line FIM:
+ *   const mid = Math.floor(|
+ *   if (nums[mid] === |
+ *   const x = (a, b) => |
+ */
+export function isMultiLineContinueSite(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+): boolean {
+    const line = document.lineAt(position.line).text;
+    const beforeCursor = line.substring(0, position.character);
+    const afterCursor = line.substring(position.character);
+
+    // Mid-expression / mid-identifier on a non-empty code line → single-line.
+    // (Exception: line ends with `{` — opening a block body.)
+    const trimmedBefore = beforeCursor.trimEnd();
+    if (trimmedBefore.length > 0 && !/\{\s*$/.test(trimmedBefore)) {
+        // Still allow blank continuation only handled below
+        if (beforeCursor.trim().length > 0) {
+            return false;
+        }
+    }
+
+    // 1. Cursor after `{` (optionally only whitespace after on this line).
+    if (/\{\s*$/.test(beforeCursor) && afterCursor.trim() === "") {
+        return hasEnclosingOpenScope(document, position);
+    }
+
+    // 2. Indent-only / empty line inside a still-open brace block (partial body).
+    if (beforeCursor.trim().length === 0 && afterCursor.trim() === "") {
+        return isInsideIncompleteBlock(document, position);
+    }
+
+    return false;
+}
+
+/** True if somewhere above the cursor an open function/block scope exists. */
+function hasEnclosingOpenScope(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+): boolean {
+    const scope = findEnclosingScope(document, position.line);
+    if (scope) {
+        return true;
+    }
+    // Fallback: any unmatched `{` above the cursor in a small window.
+    return braceDepthUpTo(document, position) > 0;
+}
+
+/**
+ * Cursor is on a blank/indent line inside a function whose body is incomplete
+ * (more `{` than `}` above, and not only outside top-level).
+ */
+function isInsideIncompleteBlock(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+): boolean {
+    const depth = braceDepthUpTo(document, position);
+    if (depth <= 0) {
+        return false;
+    }
+    // Prefer being inside a named function / method scope so top-level
+    // object literals don't always expand multi-line.
+    const scope = findEnclosingScope(document, position.line);
+    return scope !== null || depth >= 1;
+}
+
+/** Net `{` − `}` from start of file (capped window) up to cursor. */
+function braceDepthUpTo(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+): number {
+    const start = Math.max(0, position.line - 120);
+    let depth = 0;
+    for (let i = start; i < position.line; i++) {
+        depth += braceDelta(document.lineAt(i).text);
+    }
+    // Include characters on the current line before the cursor.
+    const partial = document.lineAt(position.line).text.substring(0, position.character);
+    depth += braceDelta(partial);
+    return depth;
+}
+
+function braceDelta(text: string): number {
+    // Ignore braces inside strings/comments lightly (fast heuristic).
+    let d = 0;
+    let inLineComment = false;
+    let inStr: string | null = null;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        const prev = i > 0 ? text[i - 1] : "";
+        if (inLineComment) {
+            continue;
+        }
+        if (inStr) {
+            if (ch === inStr && prev !== "\\") {
+                inStr = null;
+            }
+            continue;
+        }
+        if (ch === "/" && text[i + 1] === "/") {
+            inLineComment = true;
+            continue;
+        }
+        if (ch === '"' || ch === "'" || ch === "`") {
+            inStr = ch;
+            continue;
+        }
+        if (ch === "{") {
+            d++;
+        } else if (ch === "}") {
+            d--;
+        }
+    }
+    return d;
+}
+
+/**
+ * Detect Copilot-style intent: comment→code (chat path).
+ *
+ * Empty JS/TS bodies and `function foo() { |` use multi-line FIM instead —
+ * chat intent was over-generating prose / wrong APIs, then quality filters
+ * rejected the whole suggestion (user saw garbage once, then nothing).
+ *
+ * Python `def` / colon bodies still use intent (no brace FIM hole).
  */
 export function detectIntent(
     document: vscode.TextDocument,
@@ -174,28 +316,35 @@ export function detectIntent(
     const beforeCursor = currentLine.substring(0, position.character);
 
     // 1. Multi-line comment block ending at/above the cursor.
-    //    Consecutive # / // / /* lines form ONE intent (general-purpose, any task).
     const block = collectCommentBlock(document, position);
     if (block && block.length >= 3) {
         return block;
     }
 
-    // 2. Signature that *opens a block* and has no body yet on this line.
-    const blockSig = beforeCursor.match(
-        /(?:function\s+[\w$]+\s*\([^)]*\)\s*\{\s*$|def\s+[\w$]+\s*\([^)]*\)\s*:\s*$|(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?\([^)]*\)\s*(?:=>|->)\s*\{\s*$|[\w$]+\s*\([^)]*\)\s*(?:=>|->)\s*\{\s*$)/,
-    );
-    if (blockSig) {
-        return `Implement the body of:\n${beforeCursor.trim()}`;
-    }
+    // 2. Python / colon-style signature or empty body only.
+    //    Brace languages: multi-line FIM (isMultiLineContinueSite) fills the hole.
+    const lang = (document.languageId || "").toLowerCase();
+    const isColonLang =
+        lang === "python" ||
+        lang === "py" ||
+        beforeCursor.includes("def ") ||
+        /:\s*$/.test(beforeCursor.trimEnd());
 
-    // 3. Empty function / block body.
-    if (beforeCursor.trim().length === 0) {
-        const emptyBody = detectEmptyBodyIntent(document, position);
-        if (emptyBody) {
-            return emptyBody;
+    if (isColonLang) {
+        const pySig = beforeCursor.match(/def\s+[\w$]+\s*\([^)]*\)\s*:\s*$/);
+        if (pySig) {
+            return `Implement the body of:\n${beforeCursor.trim()}`;
+        }
+        if (beforeCursor.trim().length === 0) {
+            const emptyBody = detectEmptyBodyIntent(document, position);
+            if (emptyBody) {
+                return emptyBody;
+            }
         }
     }
 
+    // 3. Brace languages: do NOT use chat intent for empty function bodies.
+    //    isMultiLineContinueSite → FIM with suffix `}` is more reliable.
     return undefined;
 }
 

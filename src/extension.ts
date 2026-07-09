@@ -14,7 +14,9 @@ let outputChannel: vscode.OutputChannel | null = null;
 export function activate(context: vscode.ExtensionContext): void {
     outputChannel = vscode.window.createOutputChannel("MLX Code Completion");
     setLogger((msg: string) => outputChannel!.appendLine(msg));
-    outputChannel.appendLine("[MLX] Extension activated (Phase A: FIM + adaptive context)");
+    outputChannel.appendLine(
+        "[MLX] Extension activated (Phases A–D: FIM, dual policy, KV cache, speculative)",
+    );
 
     const editorConfig = vscode.workspace.getConfiguration("editor");
     void editorConfig.update("inlineSuggest.enabled", true, vscode.ConfigurationTarget.Global);
@@ -29,10 +31,25 @@ export function activate(context: vscode.ExtensionContext): void {
     const contextLinesBefore = config.get<number>("contextLinesBefore") || 60;
     const contextLinesAfter = config.get<number>("contextLinesAfter") || 15;
 
+    // Phase D: speculative decoding
+    // Empty draftModelPath = auto-pick smaller sibling; disable via speculative=false.
+    const speculativeEnabled = config.get<boolean>("speculative") !== false;
+    const draftModelPathRaw = (config.get<string>("draftModelPath") || "").trim();
+    const draftModelPath = draftModelPathRaw
+        ? resolveDraftModelPath(draftModelPathRaw)
+        : undefined; // undefined → server auto-picks
+    const numDraftTokens = Math.max(
+        1,
+        Math.min(8, config.get<number>("numDraftTokens") || 3),
+    );
+
     outputChannel.appendLine(
         `[MLX] model=${modelPath || "(server default)"} quant=${quantization} ` +
             `debounce=${debounceMs}ms maxTok=${maxTokens} ` +
-            `ctxCap=${contextLinesBefore}/${contextLinesAfter}`,
+            `ctxCap=${contextLinesBefore}/${contextLinesAfter} ` +
+            `spec=${speculativeEnabled ? "on" : "off"} ` +
+            `draft=${draftModelPath ?? "(auto)"} ` +
+            `numDraft=${numDraftTokens}`,
     );
 
     const serverScript = path.join(context.extensionPath, "python-server", "server.py");
@@ -50,6 +67,11 @@ export function activate(context: vscode.ExtensionContext): void {
         maxTokens,
         config.get<number>("temperature") || 0.0,
         outputChannel,
+        {
+            enabled: speculativeEnabled,
+            draftModelPath,
+            numDraftTokens,
+        },
     );
 
     let backendReady = false;
@@ -171,4 +193,21 @@ function resolveModelPath(configured: string): string {
         }
     }
     return configured || path.join(home, ".mlx-models", "Qwen2.5-Coder-3B-4bit");
+}
+
+/**
+ * Resolve an explicit draft model path for Phase D.
+ * Caller only invokes this when the setting is non-empty.
+ * Missing path → "" so the server can still auto-pick / log.
+ */
+function resolveDraftModelPath(configured: string): string {
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    const expanded = configured.startsWith("~")
+        ? path.join(home, configured.slice(1))
+        : configured;
+    if (fs.existsSync(path.join(expanded, "config.json"))) {
+        return expanded;
+    }
+    // Path configured but missing — leave empty so server falls back to auto.
+    return "";
 }
