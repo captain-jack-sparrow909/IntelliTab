@@ -71,6 +71,9 @@ python -c "from huggingface_hub import snapshot_download; from pathlib import Pa
 
 # Heavier / higher quality (set mlxCompletion.modelPath)
 python -c "from huggingface_hub import snapshot_download; from pathlib import Path; snapshot_download('lmstudio-community/Qwen2.5-Coder-7B-Instruct-MLX-4bit', local_dir=str(Path.home()/'.mlx-models'/'Qwen2.5-Coder-7B-Instruct-MLX-4bit'))"
+
+# Phase D draft (auto-picked when present; speeds long intent decode on 7B)
+python -c "from huggingface_hub import snapshot_download; from pathlib import Path; snapshot_download('mlx-community/Qwen2.5-Coder-0.5B-Instruct-4bit', local_dir=str(Path.home()/'.mlx-models'/'Qwen2.5-Coder-0.5B-Instruct-4bit'))"
 ```
 
 ### 3. Configure the extension
@@ -79,13 +82,16 @@ Open VS Code Settings (`Cmd+,`) and search for "MLX Code Completion". Set:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `mlxCompletion.modelPath` | `""` | Empty = auto (`~/.mlx-models/Qwen2.5-Coder-3B-4bit` preferred). |
+| `mlxCompletion.modelPath` | `""` | Empty = auto (prefers 7B Instruct if installed, else 3B). |
 | `mlxCompletion.quantization` | `4bit` | Only applied if checkpoint is not already quantized. |
-| `mlxCompletion.debounceMs` | `40` | Debounce delay (20–200 ms). |
-| `mlxCompletion.maxTokens` | `32` | FIM max tokens (intent uses 96–192). |
+| `mlxCompletion.debounceMs` | `50` | Debounce delay (35–200 ms). |
+| `mlxCompletion.maxTokens` | `32` | FIM max tokens (intent uses more + early-stop). |
 | `mlxCompletion.temperature` | `0.0` | Greedy decode for stable completions. |
-| `mlxCompletion.contextLinesBefore` | `80` | **Upper bound** for adaptive context. |
-| `mlxCompletion.contextLinesAfter` | `20` | **Upper bound** for adaptive context. |
+| `mlxCompletion.contextLinesBefore` | `60` | **Upper bound** for adaptive context. |
+| `mlxCompletion.contextLinesAfter` | `15` | **Upper bound** for adaptive context. |
+| `mlxCompletion.speculative` | `true` | Phase D: draft-model speculative decoding (same quality). |
+| `mlxCompletion.draftModelPath` | `""` | Empty = auto-pick smaller sibling (e.g. 0.5B). |
+| `mlxCompletion.numDraftTokens` | `3` | Draft tokens per verification step (1–8). |
 
 ### 4. Build and run
 
@@ -169,10 +175,10 @@ ide-extension/
 ## Future Work
 
 - [x] Inline ghost-text mode (`InlineCompletionItemProvider`)
-- [x] Phase A: FIM base 3B + adaptive context + dual policy
-- [ ] Phase B: tighter dual decode policies / accept-rate metrics
-- [ ] Phase C: Prefix / token caching
-- [ ] Phase D: Speculative decoding (draft 1.5B + target 3B/7B)
-- [ ] Phase E: Optional 7B only for low-confidence intent
+- [x] Phase A: FIM + adaptive context
+- [x] Phase B: dual policy (FIM mid-line vs intent) + structural filters
+- [x] Phase C: Prefix / KV cache (reuse shared prompt prefill across keystrokes)
+- [x] Phase D: Speculative decoding (draft model + target; same quality, faster long decode)
+- [ ] Phase E: Optional smaller model for mid-line only
 - [ ] Support for JetBrains IDEs (PyCharm, etc.)
 - [ ] Richer UI (accept/reject indicators, partial acceptance)

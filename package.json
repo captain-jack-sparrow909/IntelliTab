@@ -62,6 +62,23 @@
           "minimum": 0.0,
           "maximum": 1.0,
           "description": "Generation temperature (0.0 = deterministic)"
+        },
+        "mlxCompletion.speculative": {
+          "type": "boolean",
+          "default": true,
+          "description": "Phase D: enable speculative decoding with a smaller draft model (same quality, faster long decode)."
+        },
+        "mlxCompletion.draftModelPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to draft model for speculative decoding. Empty = auto-pick a smaller sibling under ~/.mlx-models (e.g. 0.5B for a 7B target). Disable with mlxCompletion.speculative=false."
+        },
+        "mlxCompletion.numDraftTokens": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Draft tokens proposed per verification step (higher can help long intent bodies if accept rate stays high)."
         }
       }
     }
