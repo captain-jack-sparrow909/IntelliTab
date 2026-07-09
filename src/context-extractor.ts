@@ -163,6 +163,8 @@ export function extractContext(
  * Detect Copilot-style intent: comment→code or empty block body.
  *
  * Mid-line expression (`=> |`) stays FIM; block openers / empty bodies use intent.
+ * Multi-line comment blocks are collected in full (not just the last line),
+ * so a stack of `#` / `//` requirements reaches the model intact.
  */
 export function detectIntent(
     document: vscode.TextDocument,
@@ -171,23 +173,14 @@ export function detectIntent(
     const currentLine = document.lineAt(position.line).text;
     const beforeCursor = currentLine.substring(0, position.character);
 
-    // 1. Comment on the current line.
-    const commentMatch = beforeCursor.match(/(?:\/\/|#|"""|'''|\/\*)\s*(.+?)\s*$/);
-    if (commentMatch && commentMatch[1].length >= 3) {
-        return commentMatch[1];
+    // 1. Multi-line comment block ending at/above the cursor.
+    //    Consecutive # / // / /* lines form ONE intent (general-purpose, any task).
+    const block = collectCommentBlock(document, position);
+    if (block && block.length >= 3) {
+        return block;
     }
 
-    // 2. Standalone comment on the line above, cursor on empty/indent line.
-    if (position.line > 0 && beforeCursor.trim().length === 0) {
-        const prevLine = document.lineAt(position.line - 1).text;
-        const prevComment = prevLine.match(/(?:\/\/|#|"""|'''|\/\*)\s*(.+?)\s*$/);
-        if (prevComment && prevComment[1].length >= 3) {
-            return prevComment[1];
-        }
-    }
-
-    // 3. Signature that *opens a block* and has no body yet on this line.
-    //    Requires `{` or Python `:` — bare `=>` is expression FIM, not intent.
+    // 2. Signature that *opens a block* and has no body yet on this line.
     const blockSig = beforeCursor.match(
         /(?:function\s+[\w$]+\s*\([^)]*\)\s*\{\s*$|def\s+[\w$]+\s*\([^)]*\)\s*:\s*$|(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?\([^)]*\)\s*(?:=>|->)\s*\{\s*$|[\w$]+\s*\([^)]*\)\s*(?:=>|->)\s*\{\s*$)/,
     );
@@ -195,7 +188,7 @@ export function detectIntent(
         return `Implement the body of:\n${beforeCursor.trim()}`;
     }
 
-    // 4. Empty function / block body: cursor on blank line inside `{ ... }`.
+    // 3. Empty function / block body.
     if (beforeCursor.trim().length === 0) {
         const emptyBody = detectEmptyBodyIntent(document, position);
         if (emptyBody) {
@@ -203,6 +196,101 @@ export function detectIntent(
         }
     }
 
+    return undefined;
+}
+
+/**
+ * Gather consecutive comment lines above (and on) the cursor into one intent string.
+ * Supports hash comments, line comments, and block-comment lines.
+ */
+function collectCommentBlock(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+): string | undefined {
+    const currentLine = document.lineAt(position.line).text;
+    const beforeCursor = currentLine.substring(0, position.character);
+
+    // Cursor must be on a comment line or on the blank line right after comments.
+    const onComment = isCommentLine(beforeCursor) || isCommentLine(currentLine);
+    const onBlankAfterComments =
+        beforeCursor.trim().length === 0 &&
+        position.line > 0 &&
+        isCommentLine(document.lineAt(position.line - 1).text);
+
+    if (!onComment && !onBlankAfterComments) {
+        return undefined;
+    }
+
+    let end = position.line;
+    if (onBlankAfterComments) {
+        end = position.line - 1;
+    }
+
+    // Walk upward while lines are comments (or blank inside a comment run).
+    let start = end;
+    while (start > 0) {
+        const prev = document.lineAt(start - 1).text;
+        if (isCommentLine(prev) || (prev.trim() === "" && start - 1 > 0 && isCommentLine(document.lineAt(start - 2).text))) {
+            start--;
+            continue;
+        }
+        break;
+    }
+
+    // If we landed mid-file after real code, only take comment run from start..end
+    const parts: string[] = [];
+    for (let i = start; i <= end; i++) {
+        const line = document.lineAt(i).text;
+        if (line.trim() === "") {
+            continue;
+        }
+        const stripped = stripCommentMarker(line);
+        if (stripped !== undefined && stripped.length > 0) {
+            parts.push(stripped);
+        }
+    }
+
+    if (parts.length === 0) {
+        return undefined;
+    }
+
+    // Single short comment like "TODO" is weak; still allow if >= 3 chars total
+    const joined = parts.join("\n").trim();
+    return joined.length >= 3 ? joined : undefined;
+}
+
+function isCommentLine(line: string): boolean {
+    const t = line.trim();
+    if (!t) {
+        return false;
+    }
+    return (
+        t.startsWith("//") ||
+        t.startsWith("#") ||
+        t.startsWith("/*") ||
+        t.startsWith("*") ||
+        t.startsWith('"""') ||
+        t.startsWith("'''")
+    );
+}
+
+function stripCommentMarker(line: string): string | undefined {
+    const t = line.trim();
+    if (t.startsWith("//")) {
+        return t.slice(2).trim();
+    }
+    if (t.startsWith("#")) {
+        return t.slice(1).trim();
+    }
+    if (t.startsWith("/*")) {
+        return t.replace(/^\/\*/, "").replace(/\*\/$/, "").trim();
+    }
+    if (t.startsWith("*")) {
+        return t.replace(/^\*+/, "").trim();
+    }
+    if (t.startsWith('"""') || t.startsWith("'''")) {
+        return t.replace(/^("""|''')/, "").replace(/("""|''')$/, "").trim();
+    }
     return undefined;
 }
 

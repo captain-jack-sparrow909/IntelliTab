@@ -60,9 +60,10 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
                 language,
                 context.get("before", ""),
             )
-            # Full bodies, but early-stop when balanced (see model.stream).
-            max_tokens = max(max_tokens, 96)
-            max_tokens = min(max_tokens, 160)
+            # Multi-line bodies: enough tokens to finish. Early-stop is conservative
+            # (single guard if/return must NOT end generation — deepEqual/clone etc.).
+            max_tokens = max(max_tokens, 140)
+            max_tokens = min(max_tokens, 220)
             stop_on_newline = False
             stop_when_balanced = True
             mode = "intent"
