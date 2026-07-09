@@ -16,7 +16,7 @@ No REST server, no Ollama, no OpenAI-compatible API. Just native IPC.
 
 ## Features
 
-- **Copilot-style completions** — completions appear in the native VS Code suggestion widget (dropdown) as you type, triggered on common characters (`.`, `(`, ` `, `=`, etc.). Accept with `Tab`/`Enter`.
+- **Copilot-style ghost text** — completions appear as dimmed inline suggestions at the cursor as you type. Accept with `Tab` (or the configured inline-suggest accept key).
 - **Intent / comment-to-code** — write a comment like `// write a function that calculates factorial` and the model generates the full implementation, in the file's language and matching the surrounding style.
 - **Instruct-based continuation** — uses the model's chat/instruct template with the code before *and* after the cursor, so it fills in the middle correctly (the base model has no true FIM training).
 - **Streaming** — tokens stream from the model and the suggestion updates as it generates.
@@ -28,9 +28,10 @@ No REST server, no Ollama, no OpenAI-compatible API. Just native IPC.
 
 | Metric | Value |
 |--------|-------|
-| First token latency | ~210ms (3B) / ~300–400ms (7B) |
+| First token latency | ~210ms (3B) / ~300–400ms (7B) — target; depends on context size |
 | Model size | ~2 GB RAM (3B, 4-bit) / ~4.3 GB RAM (7B, 4-bit) |
-| Max tokens per completion | 64 (configurable; 512 for intent mode) |
+| Max tokens per completion | 32 default (early-stop on newline for normal mode; ~128 for intent) |
+| Context window (default) | 60 lines before / 15 after (smaller = faster prefill) |
 
 ## Requirements
 
@@ -71,11 +72,11 @@ Open VS Code Settings (`Cmd+,`) and search for "MLX Code Completion". Set:
 |---------|---------|-------------|
 | `mlxCompletion.modelPath` | `""` | Path to MLX model directory. Empty = the built-in default (7B). |
 | `mlxCompletion.quantization` | `4bit` | Quantization level (`4bit`, `8bit`, `BF16`) — only applied if the model isn't already quantized. |
-| `mlxCompletion.debounceMs` | `50` | Debounce delay (40–200 ms). |
-| `mlxCompletion.maxTokens` | `64` | Maximum tokens to generate per completion. |
+| `mlxCompletion.debounceMs` | `40` | Debounce delay (20–200 ms). Lower = snappier. |
+| `mlxCompletion.maxTokens` | `32` | Max tokens for normal completion (intent uses more). |
 | `mlxCompletion.temperature` | `0.0` | Generation temperature (0.0 = deterministic). |
-| `mlxCompletion.contextLinesBefore` | `150` | Lines before cursor to include. |
-| `mlxCompletion.contextLinesAfter` | `35` | Lines after cursor to include. |
+| `mlxCompletion.contextLinesBefore` | `60` | Lines before cursor (lower = faster). |
+| `mlxCompletion.contextLinesAfter` | `15` | Lines after cursor (lower = faster). |
 
 ### 4. Build and run
 
@@ -87,17 +88,17 @@ npm run compile
 Then open the extension in VS Code:
 1. Open this folder in VS Code.
 2. Press `F5` (Debug: Start Debugging). A new **Extension Development Host** window opens with the extension loaded and the project folder open.
-3. In the host window, open a code file and start typing. Suggestions appear in the dropdown; accept with `Tab`/`Enter`.
-4. For comment-to-code: write a comment describing a function, press Enter to a new line, then type a space to get the implementation.
+3. In the host window, open a code file and start typing. Ghost text appears at the cursor; accept with `Tab`.
+4. For comment-to-code: write a comment describing a function, press Enter to a new line, then type to get the implementation as ghost text.
 
-> **Tip:** If `editor.quickSuggestions` is off for the language, the dropdown may not auto-show. You can always press `Ctrl+Space` to trigger it manually. The extension also enables `editor.inlineSuggest.enabled` and `editor.quickSuggestions` on activation.
+> **Tip:** Ghost text requires `editor.inlineSuggest.enabled` (the extension turns this on at activation). If nothing appears, open **Output → "MLX Code Completion"** for logs, or run **Trigger Inline Suggestion** from the command palette.
 
 ## How It Works
 
 ### VS Code Extension (`src/`)
 
 1. **`extension.ts`** — Entry point. Spawns the Python process, registers the completion provider (`CompletionItemProvider`) with trigger characters, and force-enables inline/quick suggestions. On `activate()` the model loads immediately; on `deactivate()` the process is killed.
-2. **`completion-provider.ts`** — Implements `CompletionItemProvider`. Detects Copilot-style *intent* (a comment or function signature at/above the cursor), extracts document context, and returns a `CompletionItem` with the streamed result. Caches completions per context and dedents/re-indents generated blocks to match the cursor.
+2. **`completion-provider.ts`** — Implements `InlineCompletionItemProvider` (ghost text). Detects Copilot-style *intent* (a comment or function signature at/above the cursor), extracts document context, and returns an `InlineCompletionItem` with correct insert range and indentation. Caches completions per context and re-triggers ghost text when VS Code cancels a slow generation.
 3. **`context-extractor.ts`** — Reads the document around the cursor (150 lines before, 35 after). Also implements `detectIntent()` for comment/signature → code, and strips a leading bracket from the suffix so the model completes a body instead of echoing a signature.
 4. **`backend-ipc.ts`** — Manages the child process lifecycle and the length-prefixed JSON IPC protocol. Handles streaming token callbacks and resolves the request when the stream ends.
 5. **`debounce.ts`** — Debounce utility with `cancel()` and `flush()` methods.
@@ -134,7 +135,7 @@ ide-extension/
 ├── README.md
 ├── src/
 │   ├── extension.ts           # Entry point — spawns backend, registers provider
-│   ├── completion-provider.ts # CompletionItemProvider (dropdown suggestions) + intent mode
+│   ├── completion-provider.ts # InlineCompletionItemProvider (ghost text) + intent mode
 │   ├── context-extractor.ts   # Extracts context window + detects intent
 │   ├── backend-ipc.ts         # Child process + length-prefixed JSON IPC
 │   └── debounce.ts            # Debounce utility
@@ -151,7 +152,7 @@ ide-extension/
 - **"Python 3 not found"** — Install Python 3.10+ and ensure it's on PATH (`which python3`).
 - **"Model not found"** — Set `mlxCompletion.modelPath` to your downloaded model directory, or download the default 7B model (see Setup).
 - **"Failed to start backend"** — Check that the model files exist at the configured path (look for `config.json` and `model.safetensors`).
-- **No suggestions appear** — Open the **Output** panel (`Cmd+Shift+U`), select **"MLX Code Completion"**, and check the logs. Confirm the backend printed "Model loaded successfully" and that `provideCompletionItems called` appears when you type. If the dropdown still doesn't show, press `Ctrl+Space`.
+- **No ghost text appears** — Open the **Output** panel (`Cmd+Shift+U`), select **"MLX Code Completion"**, and check the logs. Confirm the backend printed "Model loaded successfully" and that `provideInlineCompletionItems called` appears when you type. Ensure `editor.inlineSuggest.enabled` is true, then try **Trigger Inline Suggestion** from the command palette.
 - **Wrong language generated from a comment** — The intent prompt uses the active file's language id; make sure the file has the correct language (e.g. a `.js` file is detected as JavaScript).
 - **Completion echoes what I already typed** — The cleanup strips a leading prefix that duplicates the current line; if it still echoes, the model is mid-identifier — type a space or finish the token and it will complete the rest.
 - **High latency / OOM** — Use the 3B model (`mlxCompletion.modelPath` → 3B path) or 4-bit quantization.
@@ -161,6 +162,6 @@ ide-extension/
 - [ ] Speculative decoding with a 1B–2B draft model (faster first token)
 - [ ] Prefix caching of the system + file-context prompt
 - [ ] Completion ranking / re-ranking across multiple candidates
-- [ ] Inline ghost-text mode (requires the `inlineCompletionsAdditions` proposed API)
+- [x] Inline ghost-text mode (`InlineCompletionItemProvider`)
 - [ ] Support for JetBrains IDEs (PyCharm, etc.)
 - [ ] Richer UI (accept/reject indicators, partial acceptance)

@@ -2,6 +2,12 @@
     "extensions.ignoreRecommendations": true,
     "typescript.tsdk": "node_modules/typescript/lib",
     "editor.inlineSuggest.enabled": true,
+    "editor.inlineSuggest.showToolbar": "onHover",
+    "editor.quickSuggestions": {
+        "other": true,
+        "comments": false,
+        "strings": false
+    },
     "terminal.integrated.env.osx": {
         "PYTHONUNBUFFERED": "1"
     }

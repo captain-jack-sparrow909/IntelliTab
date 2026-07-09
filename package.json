@@ -14,6 +14,12 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "commands": [
+      {
+        "command": "mlxCompletion.trigger",
+        "title": "MLX: Trigger Inline Completion"
+      }
+    ],
     "configuration": {
       "title": "MLX Code Completion",
       "properties": {
@@ -30,25 +36,25 @@
         },
         "mlxCompletion.debounceMs": {
           "type": "number",
-          "default": 50,
-          "minimum": 40,
+          "default": 40,
+          "minimum": 20,
           "maximum": 200,
-          "description": "Debounce delay in milliseconds (40-200)"
+          "description": "Debounce delay in milliseconds before requesting a completion (20-200). Lower = snappier, more model load."
         },
         "mlxCompletion.maxTokens": {
           "type": "number",
-          "default": 64,
-          "description": "Maximum tokens to generate per completion"
+          "default": 32,
+          "description": "Maximum tokens per normal completion (intent mode uses more). Lower = faster."
         },
         "mlxCompletion.contextLinesBefore": {
           "type": "number",
-          "default": 150,
-          "description": "Number of lines before cursor to include in context"
+          "default": 60,
+          "description": "Lines before cursor to include. Lower = faster prefill."
         },
         "mlxCompletion.contextLinesAfter": {
           "type": "number",
-          "default": 35,
-          "description": "Number of lines after cursor to include in context"
+          "default": 15,
+          "description": "Lines after cursor to include. Lower = faster prefill."
         },
         "mlxCompletion.temperature": {
           "type": "number",

@@ -1,14 +1,20 @@
 /**
- * Inline completion provider (ghost text).
+ * Inline completion provider (ghost text) — latency-first.
+ *
+ * Strategy:
+ * 1. Cancel any previous backend job when the cursor context changes
+ * 2. Stream tokens; paint partial ghost text as soon as usable
+ * 3. Prefer single-line completions (early stop) for the common case
+ * 4. Cache final + partial results for re-trigger after VS Code cancels
  */
 
 import * as vscode from "vscode";
 import { extractContext, detectIntent, DocumentContext } from "./context-extractor";
-import { BackendIPC, TokenCallback } from "./backend-ipc";
+import { BackendIPC } from "./backend-ipc";
 
 let logFn: ((msg: string) => void) | null = null;
 
-export function setLogger(fn: (msg: string) => void): void {
+export function setLogger(fn: ((msg: string) => void) | null): void {
     logFn = fn;
 }
 
@@ -16,83 +22,61 @@ function log(msg: string): void {
     logFn?.(msg);
 }
 
-export class CompletionProvider implements vscode.CompletionItemProvider {
-    private lastContextKey = "";
-    private debounceTimer: ReturnType<typeof setTimeout> | null = null;
-    private debounceMs: number;
+interface GenState {
+    promise: Promise<string | null>;
+    partial: string;
+    done: boolean;
+}
+
+export class CompletionProvider implements vscode.InlineCompletionItemProvider {
     private maxTokens: number;
     private linesBefore: number;
     private linesAfter: number;
     private backend: BackendIPC;
-    // Cache of generated completions keyed by contextKey. Generation runs to
-    // completion independent of VS Code's request cancellation, so a result is
-    // available when the provider is queried again (or on the next keystroke).
+
+    /** Finalized completions. */
     private completions = new Map<string, string>();
-    private inFlight = new Map<string, boolean>();
+    /** In-flight / partial generations by context key. */
+    private gens = new Map<string, GenState>();
+    /** Only one logical generation at a time (matches single GPU worker). */
+    private activeKey: string | null = null;
 
-    private toCompletionItem(text: string, document: vscode.TextDocument, position: vscode.Position): vscode.CompletionItem {
-        const firstLine = text.split("\n")[0] || "completion";
-        const label = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
-        const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
-        const range = document.getWordRangeAtPosition(position) ?? new vscode.Range(position, position);
-        item.range = range;
-        item.insertText = new vscode.SnippetString(text);
-        item.detail = "MLX Code Completion";
-        item.documentation = new vscode.MarkdownString("```\n" + text + "\n```");
-        item.sortText = " ";
-        item.preselect = true;
-        return item;
-    }
-
+    private partialRetriggerTimer: ReturnType<typeof setTimeout> | null = null;
+    private lastPartialShown = "";
 
     constructor(
         backend: BackendIPC,
-        debounceMs: number,
+        _debounceMs: number,
         maxTokens: number,
         outputChannel: vscode.OutputChannel | null,
-        linesBefore: number = 150,
-        linesAfter: number = 35,
+        linesBefore: number = 60,
+        linesAfter: number = 15,
     ) {
         this.backend = backend;
-        this.debounceMs = debounceMs;
         this.maxTokens = maxTokens;
         this.linesBefore = linesBefore;
         this.linesAfter = linesAfter;
         setLogger((msg: string) => outputChannel?.appendLine(msg));
-        log("Provider constructed");
+        log("Inline completion provider constructed (latency mode)");
     }
 
-    async provideCompletionItems(
+    async provideInlineCompletionItems(
         document: vscode.TextDocument,
         position: vscode.Position,
+        _context: vscode.InlineCompletionContext,
         token: vscode.CancellationToken,
-        context: vscode.CompletionContext,
-    ): Promise<vscode.CompletionItem[]> {
-        log(`[Provider] provideCompletionItems called`);
-        log(`[Provider] document: ${document.uri.fsPath}`);
-        log(`[Provider] scheme: ${document.uri.scheme}`);
-        log(`[Provider] position: line=${position.line}, char=${position.character}`);
-        log(`[Provider] backend isRunning: ${this.backend.isRunning()}`);
-
-        // Only work with file URIs
-        if (document.uri.scheme !== "file") {
-            log("[Provider] -> NOT a file URI, returning []");
-            return [];
+    ): Promise<vscode.InlineCompletionItem[] | vscode.InlineCompletionList | null> {
+        if (document.uri.scheme !== "file" && document.uri.scheme !== "untitled") {
+            return null;
         }
-
-        // Ignore if cursor is at the very start
-        if (position.line === 0 && position.character === 0) {
-            log("[Provider] -> cursor at start, returning []");
-            return [];
+        if (!this.backend.isRunning()) {
+            return null;
         }
-
-        // Check if cursor is at a valid position
         if (!this.isCompletionValid(document, position)) {
-            log("[Provider] -> invalid position, returning []");
-            return [];
+            return null;
         }
 
-        // Build a context key
+        const t0 = Date.now();
         const intent = detectIntent(document, position);
         const contextData: DocumentContext = extractContext(
             document,
@@ -103,185 +87,347 @@ export class CompletionProvider implements vscode.CompletionItemProvider {
         if (intent) {
             contextData.intent = intent;
         }
-        // Intent generations use a larger budget and aren't truncated to one line.
         const isIntent = !!intent;
+
+        const linePrefix = document
+            .lineAt(position.line)
+            .text.substring(0, position.character);
         const contextKey = isIntent
-            ? `intent:${intent}:${position.line}:${position.character}`
-            : `${contextData.before.length}:${contextData.after.length}:${position.line}:${position.character}`;
+            ? `i:${intent}:${position.line}:${linePrefix}`
+            : `c:${linePrefix}|${hashShort(contextData.after)}|${position.line}:${position.character}`;
 
-        log(`[Provider] context key: ${contextKey}`);
-        log(`[Provider] last context key: ${this.lastContextKey}`);
-
-        // Return a cached completion if we already generated one for this context.
+        // 1) Final cache
         const cached = this.completions.get(contextKey);
-        if (cached && cached.trim().length > 0) {
-            log(`[Provider] -> returning cached completion (${cached.length} chars)`);
-            return [this.toCompletionItem(cached, document, position)];
+        if (cached) {
+            return this.toInlineItems(cached, position);
         }
 
-        // If a generation for this context is already running, don't start another.
-        if (this.inFlight.get(contextKey)) {
-            log("[Provider] -> generation already in flight, returning []");
-            return [];
+        // 2) Partial already streaming — show it immediately (fast path)
+        const existing = this.gens.get(contextKey);
+        if (existing?.partial) {
+            if (existing.done && existing.partial) {
+                this.completions.set(contextKey, existing.partial);
+                return this.toInlineItems(existing.partial, position);
+            }
+            // Return current partial; keep generation going.
+            if (token.isCancellationRequested) {
+                return null;
+            }
+            return this.toInlineItems(existing.partial, position);
         }
 
-        // Don't re-request if context hasn't changed since last keystroke-triggered gen
-        if (contextKey === this.lastContextKey) {
-            log("[Provider] -> context unchanged, returning []");
-            return [];
+        // 3) Join in-flight without partial yet — wait briefly for first tokens
+        if (existing && !existing.done) {
+            const first = await waitForPartialOrDone(existing, token, 120);
+            if (token.isCancellationRequested) {
+                return null;
+            }
+            if (first) {
+                return this.toInlineItems(first, position);
+            }
+            // Still nothing usable — let re-trigger pick it up
+            return null;
         }
-        this.lastContextKey = contextKey;
 
-        // Kick off generation. This runs to completion independent of VS Code's
-        // request cancellation. We return a promise that resolves with the
-        // completion as soon as generation finishes, so whichever caller invoked
-        // us (inline provider or fallback dropdown) gets the result directly.
-        this.inFlight.set(contextKey, true);
+        // 4) Start a new generation (cancels any previous backend job)
+        if (this.activeKey && this.activeKey !== contextKey) {
+            this.gens.delete(this.activeKey);
+        }
+        this.activeKey = contextKey;
+
+        const gen = this.startGeneration(contextData, isIntent, document, position, contextKey);
+        this.gens.set(contextKey, gen);
+
+        // Wait a short window for first paint so one provider call can show ghost text
+        // without needing a full re-trigger when the model is warm.
+        const first = await waitForPartialOrDone(gen, token, 400);
+        log(
+            `[Provider] key=${contextKey.slice(0, 60)} first=${first ? first.length : 0}ch ` +
+                `in ${Date.now() - t0}ms cancel=${token.isCancellationRequested}`,
+        );
+
+        if (token.isCancellationRequested) {
+            // Generation continues; partial re-triggers will show ghost text.
+            return first ? this.toInlineItems(first, position) : null;
+        }
+        if (!first) {
+            return null;
+        }
+        return this.toInlineItems(first, position);
+    }
+
+    private startGeneration(
+        contextData: DocumentContext,
+        isIntent: boolean,
+        document: vscode.TextDocument,
+        position: vscode.Position,
+        contextKey: string,
+    ): GenState {
+        const state: GenState = {
+            promise: Promise.resolve(null),
+            partial: "",
+            done: false,
+        };
+
+        const t0 = Date.now();
+        let firstTokenAt = 0;
         let accumulated = "";
-        const streamCb: TokenCallback = (tokenText: string) => {
-            if (tokenText) {
-                accumulated += tokenText;
-                log(`[Provider] -> token: ${JSON.stringify(tokenText)}`);
+
+        // Mid-line / empty-body: stop at first newline for snappy single-line ghost text.
+        // Multi-line intent (comment→code) keeps going.
+        const stopOnNewline = !isIntent;
+        const maxTok = isIntent ? Math.max(this.maxTokens, 128) : this.maxTokens;
+
+        const onToken = (tokenText: string) => {
+            if (!tokenText) {
+                return;
+            }
+            if (!firstTokenAt) {
+                firstTokenAt = Date.now();
+                log(`[Provider] TTFT ${firstTokenAt - t0}ms`);
+            }
+            accumulated += tokenText;
+
+            let cleaned = cleanCompletion(accumulated, contextData.before, isIntent);
+            if (cleaned) {
+                cleaned = normalizeIndentation(cleaned, document, position);
+            }
+            if (cleaned && cleaned.length > 0 && cleaned !== state.partial) {
+                state.partial = cleaned;
+                // Throttled re-trigger so VS Code paints progressive ghost text
+                // even if the original provider call was cancelled.
+                this.schedulePartialRetrigger(cleaned);
             }
         };
 
-        log("[Provider] -> starting background generation" + (isIntent ? " (intent mode)" : ""));
-        return new Promise<vscode.CompletionItem[]>((resolve) => {
-            this.backend
-                .complete(
-                    contextData,
-                    undefined as unknown as vscode.CancellationToken,
-                    streamCb,
-                    isIntent ? 512 : undefined,
-                )
-                .then(() => {
-                    this.inFlight.delete(contextKey);
-                    let cleaned = cleanCompletion(accumulated, contextData.before, isIntent);
-                    if (cleaned && isIntent) {
-                        // Normalize indentation: dedent the block, then indent it
-                        // to match the cursor line so it nests correctly.
-                        const lines = cleaned.split("\n");
-                        const indents = lines.filter((l) => l.trim().length > 0)
-                            .map((l) => l.match(/^\s*/)?.[0].length ?? 0);
-                        const minIndent = indents.length ? Math.min(...indents) : 0;
-                        const dedented = lines
-                            .map((l) => (l.length >= minIndent ? l.slice(minIndent) : l))
-                            .join("\n");
-                        const lineText = document.lineAt(position.line).text;
-                        const indent = lineText.match(/^\s*/)?.[0] ?? "";
-                        cleaned = dedented
-                            .split("\n")
-                            .map((ln, i) => (i === 0 || ln.length === 0 ? ln : indent + ln))
-                            .join("\n");
+        state.promise = this.backend
+            .complete(contextData, onToken, {
+                maxTokens: maxTok,
+                stopOnNewline,
+            })
+            .then(() => {
+                state.done = true;
+                let cleaned = cleanCompletion(accumulated, contextData.before, isIntent);
+                if (cleaned) {
+                    cleaned = normalizeIndentation(cleaned, document, position);
+                }
+                if (cleaned && cleaned.length > 0) {
+                    state.partial = cleaned;
+                    this.completions.set(contextKey, cleaned);
+                    if (this.completions.size > 40) {
+                        const first = this.completions.keys().next().value;
+                        if (first !== undefined) {
+                            this.completions.delete(first);
+                        }
                     }
-                    if (cleaned) {
-                        this.completions.set(contextKey, cleaned);
-                        log(`[Provider] -> cached completion (${cleaned.length} chars)`);
-                        log(`[Provider] -> CLEANED TEXT: ${JSON.stringify(cleaned)}`);
-                        resolve([this.toCompletionItem(cleaned, document, position)]);
-                    } else {
-                        log("[Provider] -> empty completion, not caching");
-                        resolve([]);
-                    }
-                })
-                .catch((err) => {
-                    this.inFlight.delete(contextKey);
-                    log(`[Provider] -> backend error: ${err.message}`);
-                    resolve([]);
-                });
-        });
+                    log(
+                        `[Provider] done ${Date.now() - t0}ms ` +
+                            `ttft=${firstTokenAt ? firstTokenAt - t0 : -1}ms ` +
+                            `len=${cleaned.length}`,
+                    );
+                    this.schedulePartialRetrigger(cleaned, true);
+                    return cleaned;
+                }
+                log(`[Provider] empty after ${Date.now() - t0}ms`);
+                return null;
+            })
+            .catch((err: Error) => {
+                state.done = true;
+                log(`[Provider] error: ${err.message}`);
+                return state.partial || null;
+            })
+            .finally(() => {
+                if (this.activeKey === contextKey) {
+                    this.activeKey = null;
+                }
+            });
+
+        return state;
+    }
+
+    private schedulePartialRetrigger(text: string, force = false): void {
+        if (!force && text === this.lastPartialShown) {
+            return;
+        }
+        if (this.partialRetriggerTimer !== null) {
+            // Coalesce rapid tokens (~1 re-trigger per 48ms)
+            return;
+        }
+        this.partialRetriggerTimer = setTimeout(() => {
+            this.partialRetriggerTimer = null;
+            this.lastPartialShown = text;
+            void vscode.commands.executeCommand("editor.action.inlineSuggest.trigger");
+        }, force ? 0 : 48);
+    }
+
+    private toInlineItems(
+        text: string,
+        position: vscode.Position,
+    ): vscode.InlineCompletionList {
+        const item = new vscode.InlineCompletionItem(text, new vscode.Range(position, position));
+        return { items: [item] };
     }
 
     private isCompletionValid(document: vscode.TextDocument, position: vscode.Position): boolean {
-        const line = document.lineAt(position.line);
-        const beforeCursor = line.text.substring(0, position.character);
-
-        if (beforeCursor.match(/\/\*/)) {
+        const beforeCursor = document
+            .lineAt(position.line)
+            .text.substring(0, position.character);
+        if (beforeCursor.includes("/*") && !beforeCursor.includes("*/")) {
             return false;
         }
-
         return true;
     }
 
     dispose(): void {
-        if (this.debounceTimer !== null) {
-            clearTimeout(this.debounceTimer);
-            this.debounceTimer = null;
+        if (this.partialRetriggerTimer !== null) {
+            clearTimeout(this.partialRetriggerTimer);
         }
+        this.completions.clear();
+        this.gens.clear();
+        this.backend.cancelActive();
     }
 }
 
-/**
- * Clean a raw model completion into a usable inline suggestion.
- *
- * The model tends to wrap output in markdown code fences (```javascript ... ```)
- * and to echo the code already present before the cursor. We strip the fences
- * and remove any leading text that duplicates what's already at the cursor.
- */
+// --- helpers -----------------------------------------------------------------
+
+function hashShort(s: string): string {
+    // Cheap stable fingerprint for context key (not cryptographic).
+    let h = 0;
+    const n = Math.min(s.length, 120);
+    for (let i = 0; i < n; i++) {
+        h = (h * 31 + s.charCodeAt(i)) | 0;
+    }
+    return `${s.length}:${h}`;
+}
+
+/** Wait until partial text exists, gen completes, cancel, or timeout. */
+function waitForPartialOrDone(
+    state: GenState,
+    token: vscode.CancellationToken,
+    timeoutMs: number,
+): Promise<string | null> {
+    if (state.partial) {
+        return Promise.resolve(state.partial);
+    }
+    if (state.done) {
+        return Promise.resolve(state.partial || null);
+    }
+    if (token.isCancellationRequested) {
+        return Promise.resolve(null);
+    }
+
+    return new Promise((resolve) => {
+        const start = Date.now();
+        const interval = setInterval(() => {
+            if (state.partial) {
+                clearInterval(interval);
+                sub.dispose();
+                resolve(state.partial);
+                return;
+            }
+            if (state.done) {
+                clearInterval(interval);
+                sub.dispose();
+                resolve(state.partial || null);
+                return;
+            }
+            if (token.isCancellationRequested || Date.now() - start >= timeoutMs) {
+                clearInterval(interval);
+                sub.dispose();
+                resolve(state.partial || null);
+            }
+        }, 16);
+
+        const sub = token.onCancellationRequested(() => {
+            clearInterval(interval);
+            sub.dispose();
+            resolve(state.partial || null);
+        });
+    });
+}
+
+function normalizeIndentation(
+    text: string,
+    document: vscode.TextDocument,
+    position: vscode.Position,
+): string {
+    const lineText = document.lineAt(position.line).text;
+    const beforeCursor = lineText.substring(0, position.character);
+    const lineIndent = (lineText.match(/^\s*/) || [""])[0];
+    const atIndentOnly = beforeCursor.trim().length === 0;
+    const baseIndent = atIndentOnly ? beforeCursor : lineIndent;
+
+    let lines = text.split("\n");
+    const nonEmpty = lines.filter((l) => l.trim().length > 0);
+    if (nonEmpty.length === 0) {
+        return "";
+    }
+    const minIndent = Math.min(
+        ...nonEmpty.map((l) => (l.match(/^\s*/) || [""])[0].length),
+    );
+    lines = lines.map((l) => {
+        if (l.trim().length === 0) {
+            return "";
+        }
+        return l.length >= minIndent ? l.slice(minIndent) : l.trimStart();
+    });
+
+    if (lines.length === 1) {
+        return lines[0].replace(/^\s+/, "");
+    }
+
+    return lines
+        .map((ln, i) => {
+            if (i === 0) {
+                return ln.replace(/^\s+/, "");
+            }
+            if (ln.length === 0) {
+                return "";
+            }
+            return baseIndent + ln;
+        })
+        .join("\n");
+}
+
 function cleanCompletion(raw: string, before: string, isIntent = false): string {
     let text = raw;
 
-    // Stop generation at the end-of-text marker.
     const eot = text.indexOf("<|endoftext|>");
     if (eot !== -1) {
         text = text.slice(0, eot);
     }
 
-    // Remove model control tokens (FIM markers, etc.).
-    text = text.replace(/<\|fim_begin\|>/g, "");
-    text = text.replace(/<\|fim_end\|>/g, "");
-    text = text.replace(/<\|fim_pad\|>/g, "");
+    text = text.replace(/<\|fim_(?:begin|end|pad|prefix|suffix|middle)\|>/g, "");
     text = text.replace(/<\|endoftext\|>/g, "");
-
-    // Remove markdown code fences anywhere (handles tokens split across fences).
+    text = text.replace(/<\|im_(?:end|start)\|>/g, "");
     text = text.replace(/```[a-zA-Z0-9]*\n?/g, "");
     text = text.replace(/```/g, "");
-
-    // Collapse the leading blank lines the model often emits.
     text = text.replace(/^\s*\n/, "");
-    // Remove a stray leading '>' left over from FIM markers.
     text = text.replace(/^>\s*/, "");
 
-    // The model echoes the code already before the cursor. Strip any leading
-    // text that duplicates the current line's prefix (e.g. you typed
-    // "const c" and the model emits "const d = ..." -> drop the echoed "const ").
     const beforeLines = before.split("\n");
-    const lastBeforeLine = beforeLines[beforeLines.length - 1];
+    const lastBeforeLine = beforeLines[beforeLines.length - 1] ?? "";
     const cursorPrefix = lastBeforeLine.trimStart();
     if (cursorPrefix && text.startsWith(cursorPrefix)) {
         text = text.slice(cursorPrefix.length);
     }
-    // Drop any leftover indentation from the stripped prefix.
+    if (!isIntent && lastBeforeLine.length > 0) {
+        const tail = lastBeforeLine.slice(-40);
+        if (tail && text.startsWith(tail)) {
+            text = text.slice(tail.length);
+        }
+    }
+
     if (!isIntent) {
         text = text.replace(/^\s+/, "");
+        // Prefer first line only for progressive mid-line completions.
+        const nl = text.indexOf("\n");
+        if (nl !== -1) {
+            text = text.slice(0, nl);
+        }
     }
 
-    // Stop at the first blank line: for inline (mid-line) completion we only
-    // want the immediate continuation, not a whole function body + examples.
-    // For intent mode we keep the full generated implementation.
-    if (!isIntent) {
-        const firstBlank = text.search(/\n\s*\n/);
-        if (firstBlank !== -1) {
-            text = text.slice(0, firstBlank);
-        }
-
-        // Drop runaway repetition (model loops on example outputs).
-        const lines = text.split("\n");
-        const seen = new Set<string>();
-        const out: string[] = [];
-        for (const ln of lines) {
-            const key = ln.trim();
-            if (key && seen.has(key) && out.length > 0) {
-                break;
-            }
-            if (key) {
-                seen.add(key);
-            }
-            out.push(ln);
-        }
-        text = out.join("\n");
-    }
-
+    text = text.replace(/[ \t]+$/gm, "");
     text = text.replace(/\s+$/, "");
     return text;
 }
