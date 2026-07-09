@@ -313,6 +313,21 @@ SCENARIOS: list[Scenario] = [
 ]
 
 
+def format_statement_newlines(text: str) -> str:
+    """Mirror of completion-provider formatStatementNewlines (keep in sync)."""
+    hs = r"[^\S\n]*"
+    stmt = (
+        r"(?:return|const|let|var|if|for|while|switch|try|throw|function|class|"
+        r"export|import|async|await|break|continue|debugger|yield|do|case|default)"
+    )
+    t = re.sub(rf";(?={hs}{stmt}\b)", ";\n", text)
+    t = re.sub(rf"\{{(?={hs}{stmt}\b)", "{\n", t)
+    t = re.sub(rf"\}}(?={hs}{stmt}\b)", "}\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    return t
+
+
 # Unit tests that don't need the model
 UNIT_INSERT_CASES = [
     # (line_before, model_raw, expect_final_line, expect_from_line_start?)
@@ -328,6 +343,33 @@ UNIT_INSERT_CASES = [
 
 def run_unit_insert_tests() -> tuple[int, int]:
     passed = failed = 0
+    print("\n=== UNIT: statement newlines ===")
+    packed = (
+        "const seen = new Set();return arr.filter(item => {\n"
+        "    const value = item[key];\n"
+        "    if (seen.has(value)) {\n"
+        "      return false;\n"
+        "    }\n"
+        "    seen.add(value);\n"
+        "    return true;\n"
+        "  });"
+    )
+    fmt = format_statement_newlines(packed)
+    if ";\nreturn arr.filter" in fmt and "for (let i = 0; i < n; i++)" not in format_statement_newlines(
+        "for (let i = 0; i < n; i++) { x(); }"
+    ).replace("for (let i = 0; i < n; i++)", "KEEP"):
+        # for-loop semis must stay intact
+        loop = format_statement_newlines("for (let i = 0; i < n; i++) { x(); }")
+        if "for (let i = 0; i < n; i++)" in loop and ";\nreturn" in fmt:
+            passed += 1
+            print("  PASS uniqueBy-style ;return break + for-loop safe")
+        else:
+            failed += 1
+            print(f"  FAIL format got loop={loop!r} fmt={fmt!r}")
+    else:
+        failed += 1
+        print(f"  FAIL formatStatementNewlines: {fmt!r}")
+
     print("\n=== UNIT: insert / clean / compose ===")
     for line_before, raw, expect_final, expect_rewrite in UNIT_INSERT_CASES:
         prep = to_insert(raw, line_before)

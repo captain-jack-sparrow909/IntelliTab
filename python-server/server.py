@@ -60,11 +60,11 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
                 language,
                 context.get("before", ""),
             )
-            # Spec / multi-line comment tasks need more room; early-stop when balanced.
-            max_tokens = max(max_tokens, 128)
-            max_tokens = min(max_tokens, 256)
+            # Multi-line bodies: enough tokens to finish. Early-stop is conservative
+            # (single guard if/return must NOT end generation — deepEqual/clone etc.).
+            max_tokens = max(max_tokens, 140)
+            max_tokens = min(max_tokens, 220)
             stop_on_newline = False
-            # Only early-stop when structure looks finished (avoids cutting try: mid-block).
             stop_when_balanced = True
             mode = "intent"
         else:

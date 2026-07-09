@@ -267,6 +267,9 @@ class ModelEngine:
                 "- No placeholders (no TODO, 'Your code here', stub comments).\n"
                 "- Produce complete, runnable code: every try has except/finally, "
                 "names you use must be defined or imported, blocks must be indented correctly.\n"
+                "- Emit the FULL body through the final return; do not stop after the first "
+                "guard if/return.\n"
+                "- Never write invalid `return ...; else` (else cannot follow return).\n"
                 "- If the request is a multi-line specification, implement the full request "
                 "in one coherent snippet.\n"
                 "- Do not invent trailing dead code or unfinished function stubs.\n"
@@ -471,10 +474,15 @@ def _nearest_signature_name(intent: str, surrounding: str) -> str:
 
 
 def _looks_complete_body(text: str) -> bool:
-    """True when a multi-line body looks finished (early-stop to save decode)."""
+    """True when a multi-line body looks finished (early-stop to save decode).
+
+    Conservative: a single guard `if (...) { return ...; }` is NOT enough —
+    many real functions start that way and continue (deepClone, deepEqual, etc.).
+    """
     t = text.strip()
-    if len(t) < 20:
+    if len(t) < 40:
         return False
+
     # Balanced braces
     depth = 0
     for ch in t:
@@ -486,6 +494,7 @@ def _looks_complete_body(text: str) -> bool:
                 return False
     if depth != 0:
         return False
+
     # Balanced parens / brackets
     for open_c, close_c in (("(", ")"), ("[", "]")):
         p = 0
@@ -498,42 +507,75 @@ def _looks_complete_body(text: str) -> bool:
                     return False
         if p != 0:
             return False
-    # Must end on a finished statement — not mid-assignment / mid-keyword
+
+    # Must end on a finished statement
     if re.search(r"\b(for|if|while|function|const|let|var|return|else)\s*$", t):
         return False
-    if re.search(r"[=+\-*/%,.]\s*$", t):  # ends with operator → incomplete
+    if re.search(r"[=+\-*/%,.]\s*$", t):
         return False
     if not re.search(r"[;}]\s*$", t):
         return False
-    # try without except/finally → incomplete
+
     if re.search(r"\btry\s*:", t) and not re.search(r"\bexcept\b|\bfinally\b", t):
         return False
     if re.search(r"\btry\s*\{", t) and not re.search(r"\bcatch\b|\bfinally\b", t):
         return False
-    # Trailing unfinished def/function header
     if re.search(r"(?:async\s+)?def\s+\w+\s*\([^)]*\)\s*:\s*$", t):
         return False
-    # Local bindings but no return yet — often still incomplete (keep decoding)
+
+    # Only a single top-level if-return guard → almost certainly incomplete
+    # (e.g. deepEqual starts with if (a===b) return true; then more logic).
+    stripped = re.sub(r"\s+", " ", t).strip()
+    if re.fullmatch(
+        r"if\s*\([^)]*\)\s*\{?\s*return\s+[^;]+;\s*\}?",
+        stripped,
+    ):
+        return False
+    if re.fullmatch(
+        r"if\s*\([^)]*\)\s*return\s+[^;]+;",
+        stripped,
+    ):
+        return False
+    # One if-block only, short, one return — treat as guard-only
+    if (
+        t.count("if") == 1
+        and t.count("return") == 1
+        and not re.search(r"\b(for|while|const|let|var)\b", t)
+        and len(t) < 120
+    ):
+        return False
+
     if (
         re.search(r"\b(const|let|var)\s+[\w$]+", t)
         and "return" not in t
         and not re.search(r"\b(throw|console\.|process\.|raise\b|logging\.)", t)
     ):
         return False
-    if "return" in t and re.search(r"[;}]\s*$", t):
-        return True
-    # Python-style complete: ends with return / raise / pass block
-    if re.search(r"\b(return|raise|pass)\b", t) and (
-        re.search(r"[;:]\s*$", t) is None or t.rstrip().endswith((")", "]", "}", '"', "'"))
-    ):
-        # Prefer ending after a full indented block
-        if not re.search(r":\s*$", t):
+
+    # Substance bar is high: many functions open with several guard returns.
+    has_loop = bool(re.search(r"\b(for|while)\b", t))
+    returns = t.count("return")
+    ends_ok = bool(re.search(r"[;}]\s*$", t))
+
+    if not ends_ok:
+        return False
+
+    # Loop bodies: only stop when the *last* statement is a return that comes
+    # after the loop closes (not `return false` inside the for-body).
+    if has_loop:
+        lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+        if not lines or not lines[-1].startswith("return"):
+            return False
+        # `}\nreturn ...` — return follows a closed block
+        if len(lines) >= 2 and lines[-2].rstrip(";") == "}":
             return True
-    if t.rstrip().endswith("}") and "return" in t and len(t) > 40:
-        return True
-    # Python file-level: has def and ends cleanly without open try
-    if re.search(r"\bdef\s+\w+", t) and re.search(r"\breturn\b", t) and not re.search(r":\s*$", t):
+        return False
+
+    # No loop yet: do not early-stop (guard-only phase of deepEqual/etc.).
+    if re.search(r"\bdef\s+\w+", t) and re.search(r"\breturn\b", t) and not re.search(
+        r":\s*$", t
+    ):
         if re.search(r"\btry\s*:", t):
-            return bool(re.search(r"\bexcept\b|\bfinally\b", t))
-        return len(t) > 80
+            return bool(re.search(r"\bexcept\b|\bfinally\b", t)) and len(t) > 100
+        return False
     return False

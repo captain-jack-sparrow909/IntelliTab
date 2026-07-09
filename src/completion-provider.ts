@@ -188,6 +188,11 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
             if (isIntent) {
                 cleaned = refineBodyInsert(cleaned, contextData.before, linePrefix);
                 cleaned = finishIncompleteBlock(cleaned);
+                cleaned = fixUnreachableElseAfterReturn(cleaned);
+            }
+            // Cheap whitespace-only formatting (no model cost): break packed statements.
+            cleaned = formatStatementNewlines(cleaned);
+            if (isIntent || cleaned.includes("\n")) {
                 cleaned = normalizeIndentation(cleaned, document, position);
             }
 
@@ -195,18 +200,25 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
             if (!prepared || !prepared.text) {
                 return null;
             }
-            if (isLowQuality(prepared.text, contextData, isIntent)) {
+            // Format again after insert shaping (range/body only) if still packed.
+            let finalText = formatStatementNewlines(prepared.text);
+            if (finalText.includes("\n") || isIntent) {
+                finalText = normalizeIndentation(finalText, document, position);
+            }
+            const formatted: PreparedCompletion = { text: finalText, range: prepared.range };
+
+            if (isLowQuality(formatted.text, contextData, isIntent)) {
                 return null;
             }
-            if (isIntent && !isStructurallyComplete(prepared.text)) {
+            if (isIntent && !isStructurallyComplete(formatted.text)) {
                 log(
                     `[Provider] reject incomplete structure: ${JSON.stringify(
-                        prepared.text.slice(0, 80),
+                        formatted.text.slice(0, 80),
                     )}`,
                 );
                 return null;
             }
-            return prepared;
+            return formatted;
         };
 
         const onToken = (tokenText: string) => {
@@ -373,6 +385,63 @@ function refineBodyInsert(text: string, before: string, lineBefore: string): str
         t = t.replace(/^\s*\n/, "");
     }
 
+    return t;
+}
+
+/**
+ * Remove illegal / unreachable `else` after `return` (common model glitch):
+ *   if (a === b) { return true; else { return false; } }
+ * → if (a === b) { return true; }
+ * Structural only — no algorithm-specific rewrites.
+ */
+function fixUnreachableElseAfterReturn(text: string): string {
+    let t = text;
+    // return <expr>; else { ... }  (brace-balanced simple blocks)
+    for (let i = 0; i < 6; i++) {
+        const next = t.replace(
+            /return\s+([^;]+);\s*else\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/g,
+            "return $1;",
+        );
+        if (next === t) {
+            break;
+        }
+        t = next;
+    }
+    // return <expr>; else return <expr>;
+    t = t.replace(/return\s+([^;]+);\s*else\s+return\s+[^;]+;/g, "return $1;");
+    return t;
+}
+
+/**
+ * Insert newlines between *same-line packed* statements only.
+ * e.g. `const s = new Set();return arr.filter(...)` → two lines.
+ * Does not re-break already-formatted multi-line code.
+ * Safe for `for (;;)` (semis followed by exprs, not statement keywords).
+ * Pure string ops — negligible latency; semantics unchanged.
+ */
+function formatStatementNewlines(text: string): string {
+    if (!text || !text.trim()) {
+        return text;
+    }
+    let t = text;
+
+    // Horizontal whitespace only — so we only fix "packed on one line".
+    const hs = "[^\\S\\n]*"; // spaces/tabs, not newlines
+    const stmt =
+        "(?:return|const|let|var|if|for|while|switch|try|throw|function|class|" +
+        "export|import|async|await|break|continue|debugger|yield|do|case|default)";
+
+    // ";return" / ";const" on the same line
+    t = t.replace(new RegExp(`;(?=${hs}${stmt}\\b)`, "g"), ";\n");
+
+    // "{return" / "{const" packed after brace on same line
+    t = t.replace(new RegExp(`\\{(?=${hs}${stmt}\\b)`, "g"), "{\n");
+
+    // "}return" / "}const" packed after closing brace on same line
+    t = t.replace(new RegExp(`\\}(?=${hs}${stmt}\\b)`, "g"), "}\n");
+
+    t = t.replace(/\n{3,}/g, "\n\n");
+    t = t.replace(/[ \t]+\n/g, "\n");
     return t;
 }
 
@@ -700,6 +769,10 @@ function isLowQuality(text: string, ctx: DocumentContext, isIntent: boolean): bo
         return true;
     }
     if (/\btry\s*\{/.test(t) && !/\bcatch\b/.test(t) && !/\bfinally\b/.test(t)) {
+        return true;
+    }
+    // Illegal: return ...; else
+    if (/return\s+[^;]+;\s*else\b/.test(t)) {
         return true;
     }
     // Trailing unfinished def/async def / function header with no body
