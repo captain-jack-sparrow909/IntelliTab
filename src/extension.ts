@@ -6,63 +6,41 @@ import * as vscode from "vscode";
 import { BackendIPC } from "./backend-ipc";
 import { CompletionProvider, setLogger } from "./completion-provider";
 import * as path from "path";
+import * as fs from "fs";
 
 let backend: BackendIPC | null = null;
 let outputChannel: vscode.OutputChannel | null = null;
 
 export function activate(context: vscode.ExtensionContext): void {
-    // Create output channel for debug logs
     outputChannel = vscode.window.createOutputChannel("MLX Code Completion");
     setLogger((msg: string) => outputChannel!.appendLine(msg));
-    outputChannel.appendLine("[MLX] Extension activated");
-    try {
-        require("fs").writeFileSync("/tmp/mlx_activated.log", new Date().toISOString() + "\n");
-    } catch {}
+    outputChannel.appendLine("[MLX] Extension activated (latency mode)");
 
-    // Ensure inline suggestions and quick suggestions are enabled in this window.
-    vscode.workspace
-        .getConfiguration("editor")
-        .update("inlineSuggest.enabled", true, vscode.ConfigurationTarget.Global)
-        .then(
-            () => outputChannel!.appendLine("[MLX] Enabled editor.inlineSuggest.enabled"),
-            (e: any) => outputChannel!.appendLine(`[MLX] Could not enable inlineSuggest: ${e}`),
-        );
-    vscode.workspace
-        .getConfiguration("editor")
-        .update("quickSuggestions", { other: true, comments: false, strings: false }, vscode.ConfigurationTarget.Global)
-        .then(
-            () => outputChannel!.appendLine("[MLX] Enabled editor.quickSuggestions"),
-            (e: any) => outputChannel!.appendLine(`[MLX] Could not enable quickSuggestions: ${e}`),
-        );
-    vscode.window.showInformationMessage("MLX Code Completion: extension activated.");
+    const editorConfig = vscode.workspace.getConfiguration("editor");
+    void editorConfig.update("inlineSuggest.enabled", true, vscode.ConfigurationTarget.Global);
 
-     const config = vscode.workspace.getConfiguration("mlxCompletion");
+    const config = vscode.workspace.getConfiguration("mlxCompletion");
     const modelPath = config.get<string>("modelPath") || "";
     const quantization = config.get<string>("quantization") || "4bit";
-    const debounceMs = config.get<number>("debounceMs") || 50;
-    const maxTokens = config.get<number>("maxTokens") || 64;
-    const contextLinesBefore = config.get<number>("contextLinesBefore") || 150;
-    const contextLinesAfter = config.get<number>("contextLinesAfter") || 35;
+    const debounceMs = Math.max(20, config.get<number>("debounceMs") || 40);
+    const maxTokens = config.get<number>("maxTokens") || 32;
+    const contextLinesBefore = config.get<number>("contextLinesBefore") || 60;
+    const contextLinesAfter = config.get<number>("contextLinesAfter") || 15;
 
-    outputChannel.appendLine(`[MLX] Model path: ${modelPath}`);
-    outputChannel.appendLine(`[MLX] Quantization: ${quantization}`);
-    outputChannel.appendLine(`[MLX] Debounce: ${debounceMs}ms`);
-    outputChannel.appendLine(`[MLX] Max tokens: ${maxTokens}`);
+    outputChannel.appendLine(
+        `[MLX] model=${modelPath || "(default)"} quant=${quantization} ` +
+            `debounce=${debounceMs}ms maxTok=${maxTokens} ` +
+            `ctx=${contextLinesBefore}/${contextLinesAfter}`,
+    );
 
-     // Find the Python server script relative to this extension
-    const extensionRoot = context.extensionPath;
-    const serverScript = path.join(extensionRoot, "python-server", "server.py");
-
-     // Check if server script exists
-    if (!require("fs").existsSync(serverScript)) {
+    const serverScript = path.join(context.extensionPath, "python-server", "server.py");
+    if (!fs.existsSync(serverScript)) {
         vscode.window.showErrorMessage(
-              `MLX Code Completion: Server script not found at ${serverScript}. ` +
-              "Please ensure the python-server directory is present."
-          );
+            `MLX Code Completion: Server script not found at ${serverScript}.`,
+        );
         return;
-     }
+    }
 
-     // Initialize backend IPC
     backend = new BackendIPC(
         serverScript,
         modelPath,
@@ -72,21 +50,45 @@ export function activate(context: vscode.ExtensionContext): void {
         outputChannel,
     );
 
-     // Start the backend (loads the model)
-    backend.start().then(() => {
-        outputChannel!.appendLine("[MLX] Backend started successfully");
-        vscode.window.showInformationMessage("MLX Code Completion: Model loaded and ready.");
-    }).catch((err) => {
-        outputChannel!.appendLine(`[MLX] Backend start failed: ${err.message}`);
-        vscode.window.showErrorMessage(
-              `MLX Code Completion: Failed to start backend: ${err.message}. ` +
-              "Please configure the model path in settings."
-          );
-    });
+    let backendReady = false;
+    let triggerTimer: ReturnType<typeof setTimeout> | null = null;
 
-     // Register inline completion provider (ghost text) for all languages.
-     // The universal "*" selector is unreliable for inline providers in some
-     // VS Code versions, so register an explicit broad set of languages.
+    const scheduleInlineTrigger = (delay = debounceMs) => {
+        if (triggerTimer !== null) {
+            clearTimeout(triggerTimer);
+        }
+        triggerTimer = setTimeout(() => {
+            triggerTimer = null;
+            if (!backendReady) {
+                return;
+            }
+            const editor = vscode.window.activeTextEditor;
+            if (!editor) {
+                return;
+            }
+            const scheme = editor.document.uri.scheme;
+            if (scheme !== "file" && scheme !== "untitled") {
+                return;
+            }
+            void vscode.commands.executeCommand("editor.action.inlineSuggest.trigger");
+        }, delay);
+    };
+
+    backend
+        .start()
+        .then(() => {
+            backendReady = true;
+            outputChannel!.appendLine("[MLX] Backend ready");
+            vscode.window.showInformationMessage("MLX Code Completion: ready.");
+            scheduleInlineTrigger(0);
+        })
+        .catch((err: Error) => {
+            outputChannel!.appendLine(`[MLX] Backend failed: ${err.message}`);
+            vscode.window.showErrorMessage(
+                `MLX Code Completion: Failed to start backend: ${err.message}`,
+            );
+        });
+
     const provider = new CompletionProvider(
         backend,
         debounceMs,
@@ -96,35 +98,44 @@ export function activate(context: vscode.ExtensionContext): void {
         contextLinesAfter,
     );
 
-    const languages = [
-        "javascript", "typescript", "python", "json", "html", "css",
-        "java", "c", "cpp", "csharp", "go", "rust", "ruby", "php",
-        "swift", "kotlin", "shellscript", "sql", "markdown", "yaml",
-        "plaintext", "xml", "scss", "less", "vue", "jsx", "tsx",
-    ];
-    const selector = languages.map((l) => ({ language: l }));
-
-    const reg = vscode.languages.registerCompletionItemProvider(
-        selector,
+    const reg = vscode.languages.registerInlineCompletionItemProvider(
+        [{ scheme: "file" }, { scheme: "untitled" }],
         provider,
-        // Trigger characters that prompt a completion request.
-        ".", "(", "\"", "'", "`", "[", "{", " ", ":", "=", ",", "\n",
-        ";", "!", ">", "<", "-", "_", "#", "@", "$", "%", "&", "*", "+", "/", "|", "~",
     );
     context.subscriptions.push(reg);
-    outputChannel.appendLine(`[MLX] Completion provider registered for ${languages.length} languages`);
+    context.subscriptions.push({ dispose: () => provider.dispose() });
 
-    // Diagnostic: confirm the extension observes document changes in the host.
+    // Trigger ghost text after typing settles (VS Code often won't auto-invoke).
     context.subscriptions.push(
         vscode.workspace.onDidChangeTextDocument((e) => {
-            if (e.document.uri.scheme === "file") {
-                outputChannel!.appendLine(
-                    `[MLX][diag] text changed in ${e.document.uri.fsPath} ` +
-                    `(lang=${e.document.languageId}, lines=${e.document.lineCount})`,
-                );
+            if (e.contentChanges.length === 0) {
+                return;
             }
+            const editor = vscode.window.activeTextEditor;
+            if (!editor || editor.document.uri.toString() !== e.document.uri.toString()) {
+                return;
+            }
+            const scheme = e.document.uri.scheme;
+            if (scheme !== "file" && scheme !== "untitled") {
+                return;
+            }
+            scheduleInlineTrigger(debounceMs);
         }),
     );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand("mlxCompletion.trigger", () => {
+            scheduleInlineTrigger(0);
+        }),
+    );
+
+    context.subscriptions.push({
+        dispose: () => {
+            if (triggerTimer !== null) {
+                clearTimeout(triggerTimer);
+            }
+        },
+    });
 }
 
 export function deactivate(): void {
