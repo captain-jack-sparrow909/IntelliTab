@@ -279,6 +279,23 @@ SCENARIOS: list[Scenario] = [
         budget_total_ms=3500,
     ),
     Scenario(
+        name="intent_no_cross_fn_paste",
+        # Earlier fn in file must not be pasted into a different empty body
+        before=(
+            "const factorial = (n) => {\n"
+            "  if (n <= 1) return 1;\n"
+            "  return n * factorial(n - 1);\n"
+            "};\n\n"
+            "const matrixMul = (a, b) => {\n  "
+        ),
+        after="\n}\n",
+        intent=True,
+        # General check: don't call the other user function from this body
+        expect_line_not_contains=["factorial(", "Your code here", "```"],
+        budget_ttft_ms=900,
+        budget_total_ms=4000,
+    ),
+    Scenario(
         name="with_nearby_add_then_sub",
         before="const add = (a, b) => a + b;\nconst sub = (a, b) => ",
         after="\n",

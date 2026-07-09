@@ -22,12 +22,12 @@ export function activate(context: vscode.ExtensionContext): void {
     const config = vscode.workspace.getConfiguration("mlxCompletion");
     const modelPath = resolveModelPath(config.get<string>("modelPath") || "");
     const quantization = config.get<string>("quantization") || "4bit";
-    // Slightly longer debounce avoids cancel-thrash while typing quickly.
-    const debounceMs = Math.max(40, config.get<number>("debounceMs") || 75);
-    const maxTokens = config.get<number>("maxTokens") || 40;
+    // 50ms is enough to coalesce keystrokes without feeling laggy.
+    const debounceMs = Math.max(35, config.get<number>("debounceMs") || 50);
+    const maxTokens = config.get<number>("maxTokens") || 32;
     // Upper bounds — adaptive extractor uses less for FIM, more for intent.
-    const contextLinesBefore = config.get<number>("contextLinesBefore") || 80;
-    const contextLinesAfter = config.get<number>("contextLinesAfter") || 20;
+    const contextLinesBefore = config.get<number>("contextLinesBefore") || 60;
+    const contextLinesAfter = config.get<number>("contextLinesAfter") || 15;
 
     outputChannel.appendLine(
         `[MLX] model=${modelPath || "(server default)"} quant=${quantization} ` +

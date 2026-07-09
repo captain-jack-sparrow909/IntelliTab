@@ -38,10 +38,11 @@ export interface ContextBudgets {
 }
 
 const DEFAULT_BUDGETS: ContextBudgets = {
-    fimBefore: 50,
-    fimAfter: 12,
-    intentBefore: 100,
-    intentAfter: 25,
+    // Smaller FIM window → faster prefill; imports+scope still added separately.
+    fimBefore: 36,
+    fimAfter: 8,
+    intentBefore: 70,
+    intentAfter: 16,
 };
 
 // --- public API -------------------------------------------------------------
@@ -161,11 +162,7 @@ export function extractContext(
 /**
  * Detect Copilot-style intent: comment→code or empty block body.
  *
- * IMPORTANT: Do NOT treat mid-line expression completions as intent.
- *   `const sub = (a, b) => |`  → normal FIM (fill expression)
- *   `const sub = (a, b) => {` + empty body → intent / block fill
- *
- * Misclassifying `=> |` as intent caused multi-line garbage like `a + b b;`.
+ * Mid-line expression (`=> |`) stays FIM; block openers / empty bodies use intent.
  */
 export function detectIntent(
     document: vscode.TextDocument,
