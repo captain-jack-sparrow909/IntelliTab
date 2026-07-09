@@ -86,6 +86,14 @@ export interface SpeculativeOptions {
     numDraftTokens?: number;
 }
 
+/** Phase E: dual-model routing options. */
+export interface DualModelOptions {
+    /** Enable fast mid-line model (default true). */
+    enabled?: boolean;
+    /** Path to fast model; omit for auto 3B; empty disables via enabled=false. */
+    fastModelPath?: string;
+}
+
 export class BackendIPC {
     private process: ChildProcess | null = null;
     private nextId = 1;
@@ -105,6 +113,7 @@ export class BackendIPC {
     /** Most recent completion request id — cancelled when a newer one starts. */
     private activeCompleteId: number | null = null;
     private speculative: SpeculativeOptions;
+    private dualModel: DualModelOptions;
 
     constructor(
         private serverScript: string,
@@ -114,9 +123,11 @@ export class BackendIPC {
         private temperature: number,
         outputChannel: vscode.OutputChannel | null = null,
         speculative: SpeculativeOptions = {},
+        dualModel: DualModelOptions = {},
     ) {
         this.outputChannel = outputChannel;
         this.speculative = speculative;
+        this.dualModel = dualModel;
     }
 
     private log(msg: string): void {
@@ -157,6 +168,16 @@ export class BackendIPC {
             this.speculative.numDraftTokens > 0
         ) {
             args.push("--num-draft-tokens", String(this.speculative.numDraftTokens));
+        }
+
+        // Phase E: dual-model routing
+        if (this.dualModel.enabled === false) {
+            args.push("--no-dual-model");
+        } else if (
+            this.dualModel.fastModelPath !== undefined &&
+            this.dualModel.fastModelPath !== ""
+        ) {
+            args.push("--fast-model", this.dualModel.fastModelPath);
         }
 
         this.process = spawn(pythonPath, args, {

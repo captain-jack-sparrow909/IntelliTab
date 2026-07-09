@@ -204,11 +204,12 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
 
             if (isIntent || multiLine) {
                 cleaned = refineBodyInsert(cleaned, contextData.before, linePrefix);
-                // Salvage first: cut prose / brace spam / invented next fns
+                // Salvage first: cut prose / demos / param shadows / brace spam
                 // before formatting so we don't polish garbage.
                 cleaned = salvageCodeCompletion(
                     cleaned,
                     contextData.after || "",
+                    contextData.before || "",
                     multiLine,
                 );
                 cleaned = finishIncompleteBlock(cleaned);
@@ -250,19 +251,31 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
                 finalText = salvageCodeCompletion(
                     finalText,
                     contextData.after || "",
+                    contextData.before || "",
                     multiLine,
                 );
             }
-            const formatted: PreparedCompletion = { text: finalText, range: prepared.range };
+            // Cheap syntax repairs before quality gates (spaces, packing).
+            finalText = repairCommonSyntaxGlitches(finalText);
 
-            if (!formatted.text.trim() || isStructurallyBroken(formatted.text)) {
+            if (!finalText.trim() || isStructurallyBroken(finalText)) {
+                log(
+                    `[Provider] reject broken: ${JSON.stringify(finalText.slice(0, 100))}`,
+                );
                 return null;
             }
-            if (isLowQuality(formatted.text, contextData, isIntent || multiLine)) {
+            if (isLowQuality(finalText, contextData, isIntent || multiLine)) {
+                log(
+                    `[Provider] reject low-quality: ${JSON.stringify(finalText.slice(0, 100))}`,
+                );
                 return null;
             }
-            // Prefer a soft-closed or useful partial over showing nothing.
-            // (Strict completeness was rejecting salvage-cut bodies → empty UI.)
+            const formatted: PreparedCompletion = {
+                text: finalText,
+                range: prepared.range,
+            };
+
+            // Soft-close only when result still passes quality (no hallucinated junk).
             if ((isIntent || multiLine) && !isStructurallyComplete(formatted.text)) {
                 const soft = softCloseOpenBlocks(formatted.text);
                 if (
@@ -276,25 +289,22 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
                     );
                     return { text: soft, range: formatted.range };
                 }
-                if (isUsefulPartial(formatted.text)) {
+                // Intent: do NOT show weak/wrong partials (accuracy > empty ghost).
+                if (isIntent) {
                     log(
-                        `[Provider] accept useful partial: ${JSON.stringify(
-                            formatted.text.slice(0, 80),
-                        )}`,
-                    );
-                    return formatted;
-                }
-                // Intent comment→code: still require completeness if partial is weak.
-                if (isIntent && !multiLine) {
-                    log(
-                        `[Provider] reject incomplete structure: ${JSON.stringify(
+                        `[Provider] reject incomplete intent: ${JSON.stringify(
                             formatted.text.slice(0, 80),
                         )}`,
                     );
                     return null;
                 }
-                // Multi-line FIM: show partial only if not broken (already checked).
-                if (formatted.text.trim().length >= 12) {
+                // Multi-line FIM: only accept solid partials that pass quality.
+                if (isUsefulPartial(formatted.text) && !isLowQuality(formatted.text, contextData, true)) {
+                    log(
+                        `[Provider] accept useful partial: ${JSON.stringify(
+                            formatted.text.slice(0, 80),
+                        )}`,
+                    );
                     return formatted;
                 }
                 return null;
@@ -444,12 +454,13 @@ function waitUntilDone(
 }
 
 /**
- * Cut / salvage multi-line completions that derail into prose, brace spam,
- * invented next functions, or runaway indentation.
+ * Cut / salvage multi-line completions that derail into prose, demos,
+ * param shadows, brace spam, invented next functions, or runaway indent.
  */
 function salvageCodeCompletion(
     text: string,
     after: string,
+    before: string,
     multiLine: boolean,
 ): string {
     let t = text;
@@ -458,10 +469,18 @@ function salvageCodeCompletion(
     }
 
     t = cutAtProse(t);
+    t = cutAtDemoLeak(t);
+    t = cutAtModuleBoilerplate(t);
+    t = cutAtParamShadow(t, before);
+    t = cutAtBrokenCloserSoup(t);
+    t = cutDeadElseAfterReturn(t);
     t = cutDuplicateStatementLines(t);
+    t = cutRepeatedDelayLoop(t);
     t = cutRunawayIndent(t);
     t = cutMisindentedClosers(t);
     t = cutBraceCloseSpam(t);
+    t = trimOverClosedBraces(t);
+    t = stripOuterFunctionCloser(t, before);
 
     if (multiLine || after) {
         t = trimMultiLineContinue(t, after);
@@ -469,6 +488,562 @@ function salvageCodeCompletion(
 
     // Drop trailing blank lines / half-open tails.
     t = t.replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n").replace(/\s+$/, "");
+    return t;
+}
+
+/**
+ * Cut file-level leakage after a body: `export default`, `module.exports`, etc.
+ */
+function cutAtModuleBoilerplate(text: string): string {
+    if (!text) {
+        return text;
+    }
+    const patterns: RegExp[] = [
+        /\n\s*export\s+default\b/,
+        /\n\s*export\s*\{/,
+        /\n\s*export\s+(?:async\s+)?(?:function|class|const|let|var)\b/,
+        /\n\s*module\.exports\b/,
+        /\n\s*exports\.\w+\s*=/,
+        // Re-declare / re-export the same binding after a closed body
+        /\n\s*;\s*\n\s*export\b/,
+    ];
+    let cut = -1;
+    for (const re of patterns) {
+        const m = re.exec(text);
+        if (m && m.index !== undefined && m.index >= 8) {
+            if (cut < 0 || m.index < cut) {
+                cut = m.index;
+            }
+        }
+    }
+    if (cut > 0) {
+        return text.slice(0, cut).replace(/\s+$/, "");
+    }
+    return text;
+}
+
+/**
+ * Stop at the first brace that over-closes the generation (depth < -1).
+ * Fixes cascading `}` that close the outer function and break structure.
+ */
+function trimOverClosedBraces(text: string): string {
+    if (!text) {
+        return text;
+    }
+    let depth = 0;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === "{") {
+            depth++;
+        } else if (ch === "}") {
+            depth--;
+            // More than one extra closer → rest is usually outer-fn / junk.
+            if (depth < -1) {
+                return text.slice(0, i).replace(/\s+$/, "");
+            }
+        }
+    }
+    // Strip a single trailing outer closer: `}\n;` or `};` when depth ended -1
+    if (depth < 0) {
+        let t = text.replace(/\s+$/, "");
+        while (depth < 0 && /\}\s*;?\s*$/.test(t)) {
+            t = t.replace(/\}\s*;?\s*$/, "").replace(/\s+$/, "");
+            depth++;
+        }
+        return t;
+    }
+    return text;
+}
+
+/**
+ * When inserting inside `const foo = async (...) => { | }`, the model often
+ * re-emits the outer closer `};` — strip it so we don't close the host function.
+ */
+function stripOuterFunctionCloser(text: string, before: string): string {
+    if (!text || !before) {
+        return text;
+    }
+    // Host already opened a function/arrow block that isn't closed in `before`.
+    const hostOpen =
+        /(?:async\s+)?function\s+[\w$]+\s*\([^)]*\)\s*\{\s*$/.test(before.trimEnd()) ||
+        /=>\s*\{\s*$/.test(before.trimEnd()) ||
+        /(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{\s*[\s\S]*$/.test(
+            before,
+        );
+    if (!hostOpen) {
+        // Also: open brace depth in before > 0 at end
+        let d = 0;
+        for (const ch of before) {
+            if (ch === "{") {
+                d++;
+            } else if (ch === "}") {
+                d--;
+            }
+        }
+        if (d <= 0) {
+            return text;
+        }
+    }
+
+    let t = text.replace(/\s+$/, "");
+    // Trailing `};` or `}` that only closes the host (generation brace bal ≤ 0)
+    if (braceBalance(t) <= 0 && /\}\s*;?\s*$/.test(t)) {
+        // Don't strip if the only content is a block that needs its closer
+        const without = t.replace(/\}\s*;?\s*$/, "").replace(/\s+$/, "");
+        if (without.length >= 8 && braceBalance(without) >= 0) {
+            t = without;
+            // One more if still over-closed
+            if (braceBalance(t) < 0) {
+                t = t.replace(/\}\s*;?\s*$/, "").replace(/\s+$/, "");
+            }
+        }
+    }
+    return t;
+}
+
+/**
+ * Extract parameter names from the nearest function signature above the cursor.
+ */
+function extractSignatureParams(before: string): string[] {
+    if (!before) {
+        return [];
+    }
+    // Prefer the last function / arrow signature in the prefix.
+    const patterns = [
+        /(?:async\s+)?function\s+[\w$]+\s*\(([^)]*)\)\s*\{[^}]*$/s,
+        /(?:async\s+)?function\s+[\w$]+\s*\(([^)]*)\)/,
+        /(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>/,
+        /(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?function\s*\(([^)]*)\)/,
+    ];
+    let args = "";
+    for (const re of patterns) {
+        const matches = [...before.matchAll(new RegExp(re.source, re.flags + "g"))];
+        if (matches.length > 0) {
+            args = matches[matches.length - 1][1] || "";
+            break;
+        }
+    }
+    if (!args.trim()) {
+        // Fallback: last (...) before a { near the end
+        const m = before.match(/\(([^)]*)\)\s*\{[\s\S]*$/);
+        if (m) {
+            args = m[1];
+        }
+    }
+    return args
+        .split(",")
+        .map((s) =>
+            s
+                .trim()
+                .replace(/\/\*[\s\S]*?\*\//g, "")
+                .replace(/^\.\.\./, "")
+                .replace(/[?=:].*$/, "")
+                .replace(/:.*$/, "")
+                .trim(),
+        )
+        .filter((p) => p.length > 0 && /^[A-Za-z_$][\w$]*$/.test(p));
+}
+
+/**
+ * Cut when the model redeclares a function parameter (e.g. `const tasks = [`
+ * inside `function promisePool(tasks, …)`).
+ */
+function cutAtParamShadow(text: string, before: string): string {
+    const params = extractSignatureParams(before);
+    if (params.length === 0 || !text) {
+        return text;
+    }
+    let cutAt = -1;
+    for (const p of params) {
+        const re = new RegExp(
+            `(^|\\n)\\s*(?:const|let|var)\\s+${p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=`,
+        );
+        const m = re.exec(text);
+        if (m && m.index !== undefined) {
+            const idx = m[1] === "\n" ? m.index + 1 : m.index;
+            // Only cut if some real body exists before the shadow
+            if (idx >= 12 && (cutAt < 0 || idx < cutAt)) {
+                cutAt = idx;
+            }
+        }
+    }
+    if (cutAt > 0) {
+        return text.slice(0, cutAt).replace(/\s+$/, "");
+    }
+    return text;
+}
+
+/**
+ * Cut demo / usage-example leakage (sample task arrays, "Task 1 completed", etc.).
+ */
+function cutAtDemoLeak(text: string): string {
+    if (!text) {
+        return text;
+    }
+    const cutPoints: number[] = [];
+
+    const patterns: RegExp[] = [
+        /\n\s*(?:const|let|var)\s+tasks\s*=\s*\[\s*\n?\s*(?:async\s*)?\(/,
+        /\n\s*(?:const|let|var)\s+\w+\s*=\s*\[\s*\n?\s*async\s*\(\)\s*=>/,
+        /Task\s*\d+\s+completed/i,
+        /resolve\(\s*['"`]Task\s*\d+/i,
+        /['"`]Task\s*\d+\s+completed['"`]/i,
+        // Sample harness after a body: bare array of async lambdas
+        /\n\s*\[\s*\n\s*async\s*\(\)\s*=>/,
+    ];
+    for (const re of patterns) {
+        const m = re.exec(text);
+        if (m && m.index !== undefined && m.index >= 8) {
+            cutPoints.push(m.index);
+        }
+    }
+
+    // Two+ setTimeout demos with async () => usually means toy examples
+    if (
+        (text.match(/setTimeout/g) || []).length >= 2 &&
+        (text.match(/async\s*\([^)]*\)\s*=>/g) || []).length >= 2
+    ) {
+        const m = /\n\s*(?:const|let|var)\s+\w+\s*=\s*\[/.exec(text);
+        if (m && m.index !== undefined && m.index >= 8) {
+            cutPoints.push(m.index);
+        }
+    }
+
+    if (cutPoints.length === 0) {
+        return text;
+    }
+    const cut = Math.min(...cutPoints);
+    return text.slice(0, cut).replace(/\s+$/, "");
+}
+
+/** True when the completion is mostly a usage demo / timeout simulation. */
+function isExampleDemoCode(text: string): boolean {
+    const t = text.trim();
+    if (!t) {
+        return false;
+    }
+    if (/Task\s*\d+\s+completed/i.test(t)) {
+        return true;
+    }
+    if (/Task\s*\$\{[^}]+\}\s*completed/i.test(t)) {
+        return true;
+    }
+    if (/resolve\(\s*['"`]Task\s*\d+/i.test(t)) {
+        return true;
+    }
+    // Stub / tutorial comments
+    if (
+        /\/\/\s*simulate\b/i.test(t) ||
+        /\/\*\s*simulate\b/i.test(t) ||
+        /\/\/\s*wait for \d/i.test(t) ||
+        /\/\/\s*for example\b/i.test(t) ||
+        /\/\/\s*placeholder\b/i.test(t)
+    ) {
+        return true;
+    }
+    // Sleep-loop "implementations" (setTimeout delays as fake work)
+    if (isTimeoutSimulationBody(t)) {
+        return true;
+    }
+    if (
+        (t.match(/setTimeout/g) || []).length >= 2 &&
+        (t.match(/async\s*\([^)]*\)\s*=>/g) || []).length >= 2
+    ) {
+        return true;
+    }
+    // Body that is mostly a sample tasks array
+    if (
+        /(?:const|let|var)\s+tasks\s*=\s*\[/.test(t) &&
+        /async\s*\(\)\s*=>/.test(t) &&
+        /setTimeout/.test(t)
+    ) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Bodies that "implement" work via repeated setTimeout sleeps + log lines.
+ * Common model failure for pools/queues/async helpers.
+ */
+function isTimeoutSimulationBody(text: string): boolean {
+    const timeouts = (text.match(/\bsetTimeout\s*\(/g) || []).length;
+    if (timeouts >= 3) {
+        return true;
+    }
+    if (timeouts >= 2 && /console\.log\s*\(\s*[`'"][^`'"]*Task/i.test(text)) {
+        return true;
+    }
+    if (
+        timeouts >= 2 &&
+        /new\s+Promise\s*\(\s*(?:resolve|\(\s*resolve\s*\))\s*=>\s*setTimeout/i.test(
+            text,
+        )
+    ) {
+        return true;
+    }
+    // Same delay repeated (e.g. 1000) thrice with awaits
+    const delayHits = text.match(/setTimeout\s*\(\s*resolve\s*,\s*(\d+)\s*\)/g) || [];
+    if (delayHits.length >= 3) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Cut repeated await setTimeout / console.log Task spam (keep prefix if any real code).
+ */
+function cutRepeatedDelayLoop(text: string): string {
+    if (!text || (text.match(/\bsetTimeout\s*\(/g) || []).length < 2) {
+        return text;
+    }
+    // First setTimeout sleep often starts the junk section
+    const m = /await\s+new\s+Promise\s*\(\s*(?:resolve|\(\s*resolve\s*\))\s*=>\s*setTimeout/i.exec(
+        text,
+    );
+    if (m && m.index !== undefined && m.index >= 20) {
+        // Only cut if this looks like a spam loop (another setTimeout follows)
+        const rest = text.slice(m.index);
+        if ((rest.match(/\bsetTimeout\s*\(/g) || []).length >= 2) {
+            return text.slice(0, m.index).replace(/\s+$/, "");
+        }
+    }
+    return text;
+}
+
+/**
+ * `return …; } else if` — dead/invalid tail after a completed return path.
+ * Common deepEqual / control-flow collapse.
+ */
+function cutDeadElseAfterReturn(text: string): string {
+    if (!text || !/\breturn\b/.test(text)) {
+        return text;
+    }
+    // return true;\n      } else if (...
+    const re = /\breturn\b[^;\n]*;\s*\n\s*\}\s*else\b/;
+    const m = re.exec(text);
+    if (!m || m.index === undefined) {
+        return text;
+    }
+    // Keep through the return statement only (drop `} else …`)
+    const returnEnd = text.indexOf(";", m.index);
+    if (returnEnd < 0) {
+        return text;
+    }
+    let head = text.slice(0, returnEnd + 1).replace(/\s+$/, "");
+    // Drop trailing incomplete openers after return
+    return head;
+}
+
+/**
+ * Capacity params (concurrency, limit, …) present in the signature but never
+ * referenced, while the body is a sequential timeout/log toy — almost always wrong.
+ */
+function ignoresCapacityParams(before: string, body: string): boolean {
+    const params = extractSignatureParams(before);
+    if (params.length === 0 || !body.trim()) {
+        return false;
+    }
+    const capacity = params.filter((p) =>
+        /^(concurrency|limit|max(?:Size|Concurrent|Workers)?|workers|poolSize|batchSize|n)$/i.test(
+            p,
+        ),
+    );
+    if (capacity.length === 0) {
+        return false;
+    }
+    const ignored = capacity.filter((p) => !new RegExp(`\\b${p}\\b`).test(body));
+    if (ignored.length === 0) {
+        return false;
+    }
+    // Only flag when body looks like naive sequential simulation / logs
+    if (isTimeoutSimulationBody(body)) {
+        return true;
+    }
+    if (
+        /console\.log/.test(body) &&
+        /Task/.test(body) &&
+        !/\bPromise\.(?:race|allSettled)\b/.test(body)
+    ) {
+        return true;
+    }
+    // Sequential for-of with bare task() and no concurrency control
+    if (
+        /for\s*\(\s*const\s+\w+\s+of\b/.test(body) &&
+        ignored.length > 0 &&
+        !/\bPromise\.(?:race|all)\b/.test(body) &&
+        (body.match(/\bawait\b/g) || []).length <= 1 &&
+        /setTimeout|console\.log/.test(body)
+    ) {
+        return true;
+    }
+    return false;
+}
+
+/** File-level export / module noise that should never appear inside a body insert. */
+function hasModuleBoilerplate(text: string): boolean {
+    return (
+        /^\s*export\s+default\b/m.test(text) ||
+        /^\s*export\s*\{/m.test(text) ||
+        /^\s*module\.exports\b/m.test(text) ||
+        /^\s*exports\.\w+\s*=/m.test(text)
+    );
+}
+
+const JS_BUILTINS = new Set([
+    "console", "Math", "Promise", "Array", "Object", "Set", "Map", "WeakMap", "WeakSet",
+    "JSON", "Error", "TypeError", "RangeError", "Date", "RegExp", "Number", "String",
+    "Boolean", "Symbol", "BigInt", "parseInt", "parseFloat", "isNaN", "isFinite",
+    "undefined", "null", "true", "false", "NaN", "Infinity", "this", "arguments",
+    "require", "module", "exports", "process", "Buffer", "setTimeout", "setInterval",
+    "clearTimeout", "clearInterval", "setImmediate", "clearImmediate", "fetch", "URL",
+    "URLSearchParams", "Uint8Array", "Int8Array", "Float32Array", "Float64Array",
+    "ArrayBuffer", "DataView", "TextEncoder", "TextDecoder", "atob", "btoa",
+    "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI",
+    "Proxy", "Reflect", "Intl", "performance", "crypto", "globalThis", "window",
+    "document", "navigator", "localStorage", "sessionStorage", "queueMicrotask",
+    "structuredClone", "AbortController", "AbortSignal", "Response", "Request", "Headers",
+]);
+
+const JS_KEYWORDS = new Set([
+    "if", "else", "for", "while", "do", "switch", "case", "break", "continue", "return",
+    "function", "const", "let", "var", "class", "new", "typeof", "instanceof", "void",
+    "delete", "throw", "try", "catch", "finally", "await", "async", "yield", "import",
+    "export", "from", "default", "extends", "super", "static", "get", "set", "of", "in",
+    "with", "debugger", "as", "enum", "implements", "interface", "package", "private",
+    "protected", "public", "type", "namespace", "abstract", "readonly", "keyof",
+    "infer", "is", "asserts", "satisfy",
+]);
+
+/**
+ * Names declared in surrounding prefix + the completion itself
+ * (params, const/let/var, function, class, catch bindings, for-of).
+ */
+function collectDeclaredNames(before: string, body: string): Set<string> {
+    const names = new Set<string>();
+    const addFrom = (src: string) => {
+        for (const m of src.matchAll(
+            /\b(?:const|let|var|function|class|async\s+function)\s+([A-Za-z_$][\w$]*)/g,
+        )) {
+            names.add(m[1]);
+        }
+        for (const m of src.matchAll(
+            /\b(?:const|let|var)\s+\{([^}]+)\}/g,
+        )) {
+            for (const part of m[1].split(",")) {
+                const id = part.trim().split(":")[0].trim().replace(/^\.\.\./, "");
+                if (/^[A-Za-z_$][\w$]*$/.test(id)) {
+                    names.add(id);
+                }
+            }
+        }
+        for (const m of src.matchAll(/\bfor\s*\(\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s+of\b/g)) {
+            names.add(m[1]);
+        }
+        for (const m of src.matchAll(/\bcatch\s*\(\s*([A-Za-z_$][\w$]*)\s*\)/g)) {
+            names.add(m[1]);
+        }
+        for (const m of src.matchAll(/\(([^)]*)\)\s*(?:=>|\{|:)/g)) {
+            for (const part of m[1].split(",")) {
+                let id = part.trim();
+                if (!id || id.startsWith("//")) {
+                    continue;
+                }
+                id = id.replace(/^\.\.\./, "").replace(/[?=:].*$/, "").trim();
+                if (/^[A-Za-z_$][\w$]*$/.test(id)) {
+                    names.add(id);
+                }
+            }
+        }
+    };
+    addFrom(before || "");
+    addFrom(body || "");
+    for (const p of extractSignatureParams(before || "")) {
+        names.add(p);
+    }
+    return names;
+}
+
+/**
+ * True when body uses object roots / free calls that are not declared
+ * (e.g. t.log, fakeLogger.info). General-purpose — no algorithm recipes.
+ */
+function hasUndeclaredRootUse(body: string, before: string): boolean {
+    const declared = collectDeclaredNames(before, body);
+    // obj.prop or obj.method(
+    for (const m of body.matchAll(/\b([A-Za-z_$][\w$]*)\s*\.\s*[A-Za-z_$]/g)) {
+        const root = m[1];
+        if (JS_KEYWORDS.has(root) || JS_BUILTINS.has(root)) {
+            continue;
+        }
+        if (!declared.has(root)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** const x = ... later x = (not ==/===) → illegal reassignment. */
+function hasConstReassignment(text: string): boolean {
+    const consts = new Set<string>();
+    for (const m of text.matchAll(/(?:^|\n)\s*const\s+([A-Za-z_$][\w$]*)\s*=/g)) {
+        consts.add(m[1]);
+    }
+    for (const name of consts) {
+        // Match assignments that are not the declaration itself
+        const re = new RegExp(
+            `(?<!(?:const|let|var|function|class|of|in)\\s+)\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=(?!=)`,
+        );
+        // Count assignments; declaration is one, any extra is bad
+        const all = [...text.matchAll(new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=(?!=)`, "g"))];
+        if (all.length >= 2) {
+            return true;
+        }
+        // Also: pending.push then pending = [] 
+        if (re.test(text) && all.length >= 2) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Obviously broken token soup the model sometimes emits mid-collapse. */
+function hasBrokenTokenSoup(text: string): boolean {
+    // `}})` / `})}` packed closers, or `}; export`
+    if (/\}\s*\}\s*\)/.test(text) || /\)\s*\}\s*\}/.test(text)) {
+        return true;
+    }
+    if (/\}\s*;\s*export\b/.test(text)) {
+        return true;
+    }
+    // `}})` style without semicolon after then-callback
+    if (/\}\s*\)\s*\)/.test(text) && !/catch\s*\(/.test(text)) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Cut/fix collapsed `.then` closers: `}})` → keep body and close as `});`.
+ * Without this, salvage leaves soup and the whole completion is rejected.
+ */
+function cutAtBrokenCloserSoup(text: string): string {
+    if (!text) {
+        return text;
+    }
+    // Prefer fixing the common then-callback collapse in place
+    let t = text.replace(/\}\s*\}\s*\)\s*;?/g, "});\n");
+    t = t.replace(/\}\s*\)\s*\)\s*;?/g, "});\n");
+
+    // If soup remains, cut before it and soft-close an open .then(
+    const m = /\}\s*\}\s*\)|\}\s*\)\s*\)/.exec(t);
+    if (m && m.index !== undefined && m.index >= 10) {
+        let head = t.slice(0, m.index).replace(/\s+$/, "");
+        if (/\.then\s*\(/.test(head) && braceBalance(head) > 0) {
+            head = head + "\n        });";
+        }
+        return head;
+    }
     return t;
 }
 
@@ -689,6 +1264,24 @@ function isStructurallyBroken(text: string): boolean {
     if (!t) {
         return true;
     }
+    if (isExampleDemoCode(t)) {
+        return true;
+    }
+    if (hasModuleBoilerplate(t)) {
+        return true;
+    }
+    if (hasBrokenTokenSoup(t)) {
+        return true;
+    }
+    if (/\bawait[A-Za-z_$]/.test(t) || /\}if\b|\}for\b|\}return\b/.test(t)) {
+        return true;
+    }
+    if (/(?<![A-Za-z0-9_$])[a-z]\.(?:log|error|warn|info|debug)\s*\(/.test(t)) {
+        return true;
+    }
+    if (hasConstReassignment(t)) {
+        return true;
+    }
     if (isProseLine(t.split("\n")[0] || "")) {
         return true;
     }
@@ -698,7 +1291,7 @@ function isStructurallyBroken(text: string): boolean {
     }
     // Wild brace imbalance in the insert alone
     const bal = braceBalance(t);
-    if (bal < -2 || bal > 5) {
+    if (bal < -1 || bal > 5) {
         return true;
     }
     // Mostly pure closing braces
@@ -812,14 +1405,39 @@ function formatStatementNewlines(text: string): string {
     // "}return" / "}const" packed after closing brace on same line
     t = t.replace(new RegExp(`\\}(?=${hs}${stmt}\\b)`, "g"), "}\n");
 
+    // "});executing" packed after then-callback close (not bare `;` — breaks for-loops)
+    t = t.replace(/\}\);(?=[^\S\n]*[A-Za-z_$])/g, "});\n");
+    t = t.replace(/\}\)(?=[^\S\n]*[A-Za-z_$])/g, "})\n");
+
+    // "}if" / "}for" packed
+    t = t.replace(/\}(?=if\b|for\b|while\b|return\b|const\b|let\b|var\b|await\b)/g, "}\n");
+
     t = t.replace(/\n{3,}/g, "\n\n");
     t = t.replace(/[ \t]+\n/g, "\n");
+    return t;
+}
+
+/**
+ * Repair common model glitches that are pure syntax (no semantic rewrite).
+ */
+function repairCommonSyntaxGlitches(text: string): string {
+    if (!text) {
+        return text;
+    }
+    let t = text;
+    // awaitPromise.all → await Promise.all
+    t = t.replace(/\bawait(Promise|async|new|typeof|void|yield)\b/g, "await $1");
+    // returnArray → return Array (common capitals)
+    t = t.replace(/\breturn(Array|Object|Promise|Math|JSON|Error|Map|Set)\b/g, "return $1");
     return t;
 }
 
 /** Drop incomplete tails and flatten useless nested blocks. */
 function finishIncompleteBlock(text: string): string {
     let t = text.replace(/\s+$/, "");
+    // Drop dead `} else if …` tails after a completed return
+    t = cutDeadElseAfterReturn(t);
+
     const lines = t.split("\n");
     while (lines.length > 0) {
         const last = lines[lines.length - 1].trim();
@@ -828,10 +1446,11 @@ function finishIncompleteBlock(text: string): string {
             continue;
         }
         if (
-            /^(for|while|if|else if|switch|catch|function|const|let|var)\b.*[({,]\s*$/.test(
+            /^(for|while|if|else if|else|switch|catch|function|const|let|var)\b.*[({,]\s*$/.test(
                 last,
             ) ||
-            /^(for|while|if)\s*\([^)]*$/.test(last) ||
+            /^(for|while|if|else if)\s*\([^)]*$/.test(last) ||
+            /^else\s*\{?\s*$/.test(last) ||
             last.endsWith("&&") ||
             last.endsWith("||") ||
             last.endsWith("?") ||
@@ -840,6 +1459,18 @@ function finishIncompleteBlock(text: string): string {
         ) {
             lines.pop();
             continue;
+        }
+        // Stray lone closers after a finished return
+        if (/^\}+\s*$/.test(last) && lines.length >= 2) {
+            const prev = lines[lines.length - 2].trim();
+            if (/^return\b/.test(prev)) {
+                // Keep balance later via softClose; drop extra closers only if over-closed
+                const soFar = lines.slice(0, -1).join("\n");
+                if (braceBalance(soFar) <= 0) {
+                    lines.pop();
+                    continue;
+                }
+            }
         }
         break;
     }
@@ -1212,6 +1843,60 @@ function isLowQuality(text: string, ctx: DocumentContext, isIntent: boolean): bo
         /\b(this code defines|the following code|as you can see)\b/i.test(t)
     ) {
         return true;
+    }
+    // Usage demos / sample tasks (common promisePool derail)
+    if (isExampleDemoCode(t)) {
+        return true;
+    }
+    // export default / module.exports inside a body insert
+    if (hasModuleBoilerplate(t)) {
+        return true;
+    }
+    if (hasBrokenTokenSoup(t)) {
+        return true;
+    }
+    // Glued keywords the model sometimes emits
+    if (/\bawait[A-Za-z_$]/.test(t)) {
+        return true;
+    }
+    if (/\}if\b|\}for\b|\}while\b|\}return\b|\}await\b/.test(t)) {
+        return true;
+    }
+    // Invented single-letter logger: t.log (not console.log)
+    if (/(?<![A-Za-z0-9_$])[a-z]\.(?:log|error|warn|info|debug)\s*\(/.test(t)) {
+        return true;
+    }
+    // const reassignment (const pending = []; pending = [])
+    if (hasConstReassignment(t)) {
+        return true;
+    }
+    // Undeclared object roots (t.log, fakeApi.call) when not in surrounding scope
+    if ((isIntent || t.includes("\n")) && hasUndeclaredRootUse(t, ctx.before || "")) {
+        return true;
+    }
+    // Timeout-sleep "implementations" / ignored concurrency params
+    if (isTimeoutSimulationBody(t)) {
+        return true;
+    }
+    if (ignoresCapacityParams(ctx.before || "", t)) {
+        return true;
+    }
+    // Dead `} else` after a return (control-flow collapse)
+    if (/\breturn\b[^;\n]*;\s*\n\s*\}\s*else\b/.test(t)) {
+        return true;
+    }
+    // Redeclare parameters from surrounding signature when we have context
+    if (isIntent && ctx.before) {
+        const params = extractSignatureParams(ctx.before);
+        for (const p of params) {
+            const re = new RegExp(
+                `(?:^|\\n)\\s*(?:const|let|var)\\s+${p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=`,
+            );
+            if (re.test(t) && t.length > 40) {
+                // Shadowing a param with a new binding in a long body → junk
+                return true;
+            }
+        }
     }
     // Generic placeholders / stubs (not spread syntax `...x`)
     if (

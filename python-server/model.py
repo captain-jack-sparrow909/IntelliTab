@@ -144,6 +144,13 @@ DRAFT_MODEL_CANDIDATES = [
     Path.home() / ".mlx-models" / "Qwen2.5-Coder-3B-Instruct-MLX-4bit",
 ]
 
+# Phase E: fast mid-line FIM model.
+# Prefer 3B Instruct: better mid-line semantics (e.g. `sub` → a-b); base 3B often maps sub→a+b.
+FAST_MODEL_CANDIDATES = [
+    Path.home() / ".mlx-models" / "Qwen2.5-Coder-3B-Instruct-MLX-4bit",
+    Path.home() / ".mlx-models" / "Qwen2.5-Coder-3B-4bit",
+]
+
 
 def resolve_model_path(explicit: Optional[str] = None) -> str:
     if explicit:
@@ -212,6 +219,43 @@ def resolve_draft_model_path(
         if "7b" not in main_name and "3b" not in main_name:
             if _rank(c.name.lower()) < _rank(main_name):
                 return str(c)
+    return None
+
+
+def resolve_fast_model_path(
+    quality_path: str,
+    explicit: Optional[str] = None,
+    enabled: bool = True,
+) -> Optional[str]:
+    """
+    Phase E: smaller model for single-line mid-expression FIM only.
+
+    Returns None when dual routing is off, quality is already small, or no
+    distinct fast checkpoint is available.
+    """
+    if not enabled:
+        return None
+    if explicit is not None and explicit.strip() == "":
+        return None
+    if explicit:
+        p = Path(explicit).expanduser()
+        if p.is_dir() and (p / "config.json").exists():
+            if p.resolve() != Path(quality_path).expanduser().resolve():
+                return str(p)
+            sys.stderr.write("[mlx] fast model same as quality — dual routing off\n")
+            return None
+        sys.stderr.write(f"[mlx] fast model path missing: {p}\n")
+        return None
+
+    quality = Path(quality_path).expanduser().resolve()
+    qname = quality.name.lower()
+    # Quality already mid-line sized — no second model.
+    if any(tag in qname for tag in ("0.5b", "1.5b", "3b")):
+        return None
+
+    for c in FAST_MODEL_CANDIDATES:
+        if c.is_dir() and (c / "config.json").exists() and c.resolve() != quality:
+            return str(c)
     return None
 
 
@@ -562,8 +606,30 @@ class ModelEngine:
                 "- Stop after the code for THIS function/block. Do not start another "
                 "function, class, or file section.\n"
                 "- No placeholders (no TODO, 'Your code here', stub comments).\n"
-                "- Produce complete, runnable code: every try has except/finally, "
-                "names you use must be defined or imported, blocks must be indented correctly.\n"
+                "- NEVER write usage examples, demos, sample data, test harnesses, "
+                "or toy async tasks (no setTimeout demos, no 'Task 1 completed', "
+                "no arrays of sample callbacks).\n"
+                "- NEVER redeclare function parameters or the function itself; "
+                "parameters already exist in scope — use them.\n"
+                "- NEVER emit export default, module.exports, imports, or any code "
+                "outside this function body. Do not close the outer function with "
+                "an extra }; if the signature is already above the cursor.\n"
+                "- Do not invent loggers, globals, or helpers that are not in scope "
+                "(no t.log, logger.x, undefined single-letter objects).\n"
+                "- Use parameters only as their names imply and as surrounding code shows. "
+                "If a parameter is named `tasks` and used with call syntax elsewhere, "
+                "treat elements as callables (e.g. task()), not as objects with invented "
+                ".run()/.name unless those appear in the surrounding file.\n"
+                "- Prefer standard library APIs (Promise, Array, Map, Set, Math). "
+                "Do not invent fake frameworks.\n"
+                "- Do not fake async work with setTimeout sleeps, Wait for N second "
+                "comments, or console.log Task completed loops. Implement real logic.\n"
+                "- If a parameter is named concurrency/limit/max, you MUST use it to "
+                "bound parallelism (e.g. Promise.race / worker slots). Never ignore it.\n"
+                "- No dead code after return (no } else after return true).\n"
+                "- Produce complete, runnable implementation code: every try has "
+                "except/finally, names you use must be defined or imported, "
+                "blocks must be indented correctly.\n"
                 "- Emit the FULL body through the final return; do not stop after the first "
                 "guard if/return.\n"
                 "- Never write invalid `return ...; else` (else cannot follow return).\n"
@@ -807,6 +873,121 @@ class ModelEngine:
                 self._active_id = None
 
 
+class DualModelRouter:
+    """
+    Phase E: route single-line mid-expression FIM to a smaller "fast" model;
+    keep multi-line FIM + intent on the quality model (typically 7B + draft).
+
+    Quality is unchanged on hard paths; mid-line gains speed from a lighter prefill.
+    """
+
+    def __init__(
+        self,
+        quality: "ModelEngine",
+        fast: Optional["ModelEngine"] = None,
+    ) -> None:
+        self.quality = quality
+        self.fast = fast
+        self.max_tokens = quality.max_tokens
+
+    @property
+    def dual_enabled(self) -> bool:
+        return self.fast is not None
+
+    @property
+    def model_path(self) -> str:
+        return self.quality.model_path
+
+    @property
+    def draft_model(self) -> Any:
+        return self.quality.draft_model
+
+    @property
+    def draft_model_path(self) -> Optional[str]:
+        return self.quality.draft_model_path
+
+    @property
+    def num_draft_tokens(self) -> int:
+        return self.quality.num_draft_tokens
+
+    def request_cancel(self, msg_id: Optional[int] = None) -> None:
+        self.quality.request_cancel(msg_id)
+        if self.fast is not None:
+            self.fast.request_cancel(msg_id)
+
+    def pick(self, *, is_intent: bool, multi_line: bool) -> "ModelEngine":
+        """Quality for hard paths; fast for single-line FIM only."""
+        if is_intent or multi_line or self.fast is None:
+            return self.quality
+        return self.fast
+
+    def route_name(self, engine: "ModelEngine") -> str:
+        if self.fast is not None and engine is self.fast:
+            return "fast"
+        return "quality"
+
+    @staticmethod
+    def create(
+        quality_path: str,
+        quantization: str = "4bit",
+        max_tokens: int = 40,
+        temperature: float = 0.0,
+        draft_model_path: Optional[str] = None,
+        speculative: bool = True,
+        num_draft_tokens: int = 3,
+        fast_model_path: Optional[str] = None,
+        dual_model: bool = True,
+    ) -> "DualModelRouter":
+        quality = ModelEngine(
+            model_path=quality_path,
+            quantization=quantization,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            draft_model_path=draft_model_path,
+            speculative=speculative,
+            num_draft_tokens=num_draft_tokens,
+        )
+
+        fast_path = resolve_fast_model_path(
+            quality.model_path,
+            explicit=fast_model_path,
+            enabled=dual_model,
+        )
+        fast: Optional[ModelEngine] = None
+        if fast_path:
+            try:
+                sys.stderr.write(
+                    f"[mlx] Phase E: loading fast mid-line model from: {fast_path}\n"
+                )
+                sys.stderr.flush()
+                # Fast path: short FIM only — no speculative draft (decode is tiny).
+                fast = ModelEngine(
+                    model_path=fast_path,
+                    quantization=quantization,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    draft_model_path="",
+                    speculative=False,
+                    num_draft_tokens=num_draft_tokens,
+                )
+                sys.stderr.write(
+                    f"[mlx] Phase E dual routing ON "
+                    f"(fast={Path(fast_path).name}, quality={Path(quality.model_path).name})\n"
+                )
+                sys.stderr.flush()
+            except Exception as e:
+                fast = None
+                sys.stderr.write(
+                    f"[mlx] Phase E fast model load failed (quality-only): {e}\n"
+                )
+                sys.stderr.flush()
+        else:
+            sys.stderr.write("[mlx] Phase E dual routing OFF (no distinct fast model)\n")
+            sys.stderr.flush()
+
+        return DualModelRouter(quality=quality, fast=fast)
+
+
 def _fim_site_ok(before: str) -> bool:
     """True when FIM is the better (and faster) choice for this cursor site."""
     s = before.rstrip("\n")
@@ -892,6 +1073,63 @@ def _looks_derailed(text: str) -> bool:
 
     # Markdown fence mid-body
     if "\n```" in text or text.startswith("```"):
+        return True
+
+    # Demo / usage-example leakage (promisePool → sample tasks, etc.)
+    if re.search(r"Task\s*\d+\s+completed", text, re.I):
+        return True
+    if re.search(r"Task\s*\$\{[^}]+\}\s*completed", text, re.I):
+        return True
+    if re.search(r"resolve\(\s*['\"`]Task\s*\d+", text, re.I):
+        return True
+    if re.search(r"['\"`]Task\s*\d+\s+completed['\"`]", text, re.I):
+        return True
+    if re.search(r"//\s*simulate\b", text, re.I) or re.search(
+        r"//\s*wait for \d", text, re.I
+    ):
+        return True
+    # Sleep-loop toy implementations (3+ setTimeouts or delay spam)
+    if len(re.findall(r"\bsetTimeout\s*\(", text)) >= 3:
+        return True
+    if len(re.findall(r"setTimeout\s*\(\s*resolve\s*,\s*\d+\s*\)", text)) >= 3:
+        return True
+    if len(re.findall(r"\bsetTimeout\s*\(", text)) >= 2 and re.search(
+        r"console\.log\s*\(\s*[`'\"].*Task", text, re.I
+    ):
+        return True
+    # Sample task arrays: const tasks = [ async () => { setTimeout...
+    if re.search(
+        r"(?:const|let|var)\s+tasks\s*=\s*\[\s*(?:async\s*)?\([^)]*\)\s*=>",
+        text,
+    ) and re.search(r"setTimeout", text):
+        return True
+    if (text.count("setTimeout") >= 2) and (
+        len(re.findall(r"async\s*\([^)]*\)\s*=>", text)) >= 2
+    ):
+        return True
+    # Dead control flow: return …; } else
+    if re.search(r"\breturn\b[^;\n]*;\s*\n\s*\}\s*else\b", text):
+        return True
+    # File-level leakage after body
+    if re.search(r"\n\s*export\s+default\b", text):
+        return True
+    if re.search(r"\n\s*module\.exports\b", text):
+        return True
+    if re.search(r"\n\s*export\s+(?:async\s+)?(?:function|class|const)\b", text):
+        return True
+    # Collapsed closer soup
+    if re.search(r"\}\s*\}\s*\)", text) or re.search(r"\}\s*;\s*export\b", text):
+        return True
+    # Glued keywords (awaitPromise, }if)
+    if re.search(r"\bawait[A-Za-z_$]", text):
+        return True
+    if re.search(r"\}if\b|\}for\b|\}while\b|\}return\b", text):
+        return True
+    # Invented single-letter logger: t.log / l.error (never console)
+    if re.search(
+        r"(?<![A-Za-z0-9_$])[a-z]\.(?:log|error|warn|info|debug)\s*\(",
+        text,
+    ):
         return True
 
     lines = text.splitlines()

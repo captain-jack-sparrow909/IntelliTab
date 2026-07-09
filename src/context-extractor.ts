@@ -300,13 +300,12 @@ function braceDelta(text: string): number {
 }
 
 /**
- * Detect Copilot-style intent: comment→code (chat path).
+ * Detect Copilot-style intent: comment→code or *empty* function body.
  *
- * Empty JS/TS bodies and `function foo() { |` use multi-line FIM instead —
- * chat intent was over-generating prose / wrong APIs, then quality filters
- * rejected the whole suggestion (user saw garbage once, then nothing).
- *
- * Python `def` / colon bodies still use intent (no brace FIM hole).
+ * Empty bodies use quality chat intent (implement the algorithm).
+ * Partial bodies mid-function use multi-line FIM (isMultiLineContinueSite).
+ * Pure FIM on empty algorithmic bodies often invents demos (sample tasks,
+ * setTimeout toys) instead of a real implementation — intent + filters fix that.
  */
 export function detectIntent(
     document: vscode.TextDocument,
@@ -321,30 +320,21 @@ export function detectIntent(
         return block;
     }
 
-    // 2. Python / colon-style signature or empty body only.
-    //    Brace languages: multi-line FIM (isMultiLineContinueSite) fills the hole.
-    const lang = (document.languageId || "").toLowerCase();
-    const isColonLang =
-        lang === "python" ||
-        lang === "py" ||
-        beforeCursor.includes("def ") ||
-        /:\s*$/.test(beforeCursor.trimEnd());
+    // 2. Python def signature on the same line.
+    if (/def\s+[\w$]+\s*\([^)]*\)\s*:\s*$/.test(beforeCursor)) {
+        return `Implement the body of:\n${beforeCursor.trim()}`;
+    }
 
-    if (isColonLang) {
-        const pySig = beforeCursor.match(/def\s+[\w$]+\s*\([^)]*\)\s*:\s*$/);
-        if (pySig) {
-            return `Implement the body of:\n${beforeCursor.trim()}`;
-        }
-        if (beforeCursor.trim().length === 0) {
-            const emptyBody = detectEmptyBodyIntent(document, position);
-            if (emptyBody) {
-                return emptyBody;
-            }
+    // 3. Truly empty function/block body → intent (quality model).
+    //    Only when there are no real statements yet (see detectEmptyBodyIntent).
+    if (beforeCursor.trim().length === 0) {
+        const emptyBody = detectEmptyBodyIntent(document, position);
+        if (emptyBody) {
+            return emptyBody;
         }
     }
 
-    // 3. Brace languages: do NOT use chat intent for empty function bodies.
-    //    isMultiLineContinueSite → FIM with suffix `}` is more reliable.
+    // 4. Partial body / mid-block → multi-line FIM (no intent).
     return undefined;
 }
 

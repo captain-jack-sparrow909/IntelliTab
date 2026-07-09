@@ -92,6 +92,8 @@ Open VS Code Settings (`Cmd+,`) and search for "MLX Code Completion". Set:
 | `mlxCompletion.speculative` | `true` | Phase D: draft-model speculative decoding (same quality). |
 | `mlxCompletion.draftModelPath` | `""` | Empty = auto-pick smaller sibling (e.g. 0.5B). |
 | `mlxCompletion.numDraftTokens` | `3` | Draft tokens per verification step (1–8). |
+| `mlxCompletion.dualModel` | `true` | Phase E: smaller model for mid-line FIM only (7B kept for hard paths). |
+| `mlxCompletion.fastModelPath` | `""` | Empty = auto (3B Instruct preferred, then 3B base). |
 
 ### 4. Build and run
 
@@ -179,6 +181,6 @@ ide-extension/
 - [x] Phase B: dual policy (FIM mid-line vs intent) + structural filters
 - [x] Phase C: Prefix / KV cache (reuse shared prompt prefill across keystrokes)
 - [x] Phase D: Speculative decoding (draft model + target; same quality, faster long decode)
-- [ ] Phase E: Optional smaller model for mid-line only
+- [x] Phase E: Dual-model routing (3B mid-line FIM; 7B + draft for multi-line / intent)
 - [ ] Support for JetBrains IDEs (PyCharm, etc.)
 - [ ] Richer UI (accept/reject indicators, partial acceptance)

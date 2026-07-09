@@ -15,7 +15,7 @@ export function activate(context: vscode.ExtensionContext): void {
     outputChannel = vscode.window.createOutputChannel("MLX Code Completion");
     setLogger((msg: string) => outputChannel!.appendLine(msg));
     outputChannel.appendLine(
-        "[MLX] Extension activated (Phases A–D: FIM, dual policy, KV cache, speculative)",
+        "[MLX] Extension activated (Phases A–E: FIM, dual policy, KV, speculative, dual-model)",
     );
 
     const editorConfig = vscode.workspace.getConfiguration("editor");
@@ -43,13 +43,22 @@ export function activate(context: vscode.ExtensionContext): void {
         Math.min(8, config.get<number>("numDraftTokens") || 3),
     );
 
+    // Phase E: dual-model routing (3B mid-line FIM, 7B hard paths)
+    const dualModelEnabled = config.get<boolean>("dualModel") !== false;
+    const fastModelPathRaw = (config.get<string>("fastModelPath") || "").trim();
+    const fastModelPath = fastModelPathRaw
+        ? resolveFastModelPath(fastModelPathRaw)
+        : undefined;
+
     outputChannel.appendLine(
         `[MLX] model=${modelPath || "(server default)"} quant=${quantization} ` +
             `debounce=${debounceMs}ms maxTok=${maxTokens} ` +
             `ctxCap=${contextLinesBefore}/${contextLinesAfter} ` +
             `spec=${speculativeEnabled ? "on" : "off"} ` +
             `draft=${draftModelPath ?? "(auto)"} ` +
-            `numDraft=${numDraftTokens}`,
+            `numDraft=${numDraftTokens} ` +
+            `dual=${dualModelEnabled ? "on" : "off"} ` +
+            `fast=${fastModelPath ?? "(auto)"}`,
     );
 
     const serverScript = path.join(context.extensionPath, "python-server", "server.py");
@@ -71,6 +80,10 @@ export function activate(context: vscode.ExtensionContext): void {
             enabled: speculativeEnabled,
             draftModelPath,
             numDraftTokens,
+        },
+        {
+            enabled: dualModelEnabled,
+            fastModelPath,
         },
     );
 
@@ -210,4 +223,9 @@ function resolveDraftModelPath(configured: string): string {
     }
     // Path configured but missing — leave empty so server falls back to auto.
     return "";
+}
+
+/** Resolve explicit Phase E fast mid-line model path. */
+function resolveFastModelPath(configured: string): string {
+    return resolveDraftModelPath(configured);
 }
