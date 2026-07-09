@@ -79,6 +79,16 @@
           "minimum": 1,
           "maximum": 8,
           "description": "Draft tokens proposed per verification step (higher can help long intent bodies if accept rate stays high)."
+        },
+        "mlxCompletion.dualModel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Phase E: use a smaller model for single-line mid-expression FIM (quality model kept for multi-line bodies and comments)."
+        },
+        "mlxCompletion.fastModelPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to the fast mid-line model. Empty = auto (prefers 3B Instruct, then 3B base). Disable dual routing with mlxCompletion.dualModel=false."
         }
       }
     }
