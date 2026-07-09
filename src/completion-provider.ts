@@ -1,12 +1,11 @@
 /**
  * Inline completion provider.
  *
- * Multi-line / factorial-class failures fixed by:
- * - Completing intent generations fully (no mid-stream publish, longer wait)
- * - Not cancelling in-flight intent for the same empty body
- * - Rejecting incomplete / placeholder / unbalanced code
- * - Stripping re-emitted signatures from body inserts
- * - Rejecting junk single-token inserts (`\n`, `;`, `const`)
+ * General-purpose completion (no per-function recipes):
+ * - FIM for mid-line; instruct body fill for empty blocks / comments
+ * - Finish intent fully; protect in-flight body gens from cancel thrash
+ * - Structural filters only (braces, placeholders, cross-file-fn paste)
+ * - Strip re-emitted signatures; reject junk tokens
  */
 
 import * as vscode from "vscode";
@@ -102,37 +101,29 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
 
         // Join in-flight work for the same key.
         if (this.activeGen && this.activeGen.contextKey === contextKey) {
-            const res = await waitUntilDone(
-                this.activeGen,
-                isIntent ? 4500 : 1200,
-            );
-            return res ? this.toInlineItems(res) : null;
+            const joined = await waitUntilDone(this.activeGen, isIntent ? 3500 : 800);
+            return joined ? this.toInlineItems(joined) : null;
         }
 
         // Protect in-flight INTENT: do not cancel mid-body generation.
         if (this.activeGen && !this.activeGen.done && this.activeGen.isIntent) {
             if (isIntent && intent && intent === this.activeGen.intentText) {
-                const res = await waitUntilDone(this.activeGen, 4500);
-                return res ? this.toInlineItems(res) : null;
+                const joined = await waitUntilDone(this.activeGen, 3500);
+                return joined ? this.toInlineItems(joined) : null;
             }
-            // User left the empty-body site — allow cancel.
-            if (isIntent) {
-                // different intent site
-            } else {
-                // typing inside incomplete body: don't kill intent if still same line region
-                const res = await waitUntilDone(this.activeGen, 4500);
-                if (res) {
-                    return this.toInlineItems(res);
+            if (!isIntent) {
+                const joined = await waitUntilDone(this.activeGen, 3500);
+                if (joined) {
+                    return this.toInlineItems(joined);
                 }
             }
         }
 
         if (this.activeGen && this.activeGen.contextKey !== contextKey) {
-            // Never cancel an unfinished intent gen for a flapping FIM key.
             if (this.activeGen.isIntent && !this.activeGen.done) {
-                const res = await waitUntilDone(this.activeGen, 4500);
-                if (res && isIntent) {
-                    return this.toInlineItems(res);
+                const joined = await waitUntilDone(this.activeGen, 3500);
+                if (joined && isIntent) {
+                    return this.toInlineItems(joined);
                 }
             } else {
                 this.backend.cancelActive();
@@ -151,13 +142,13 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
         );
         this.activeGen = gen;
 
-        const res = await waitUntilDone(gen, isIntent ? 4500 : 1200);
+        const result = await waitUntilDone(gen, isIntent ? 3500 : 800);
         log(
             `[Provider] mode=${contextData.mode} ` +
-                `out=${res ? JSON.stringify(res.text.slice(0, 80)) : "null"} ` +
+                `out=${result ? JSON.stringify(result.text.slice(0, 80)) : "null"} ` +
                 `${Date.now() - t0}ms`,
         );
-        return res ? this.toInlineItems(res) : null;
+        return result ? this.toInlineItems(result) : null;
     }
 
     private startGeneration(
@@ -183,9 +174,10 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
         let accumulated = "";
 
         const stopOnNewline = !isIntent;
+        // FIM: short decode. Intent: enough for a full body; server early-stops when balanced.
         const maxTok = isIntent
-            ? Math.min(220, Math.max(this.maxTokens, 160))
-            : Math.max(20, Math.min(40, this.maxTokens || 32));
+            ? Math.min(160, Math.max(this.maxTokens, 96))
+            : Math.max(16, Math.min(28, this.maxTokens || 28));
 
         const prepare = (raw: string): PreparedCompletion | null => {
             let cleaned = cleanRaw(raw);
@@ -196,7 +188,6 @@ export class CompletionProvider implements vscode.InlineCompletionItemProvider {
             if (isIntent) {
                 cleaned = refineBodyInsert(cleaned, contextData.before, linePrefix);
                 cleaned = finishIncompleteBlock(cleaned);
-                cleaned = fixCommonMathBaseCases(cleaned, contextData.before + "\n" + (intentText || ""));
                 cleaned = normalizeIndentation(cleaned, document, position);
             }
 
@@ -355,7 +346,7 @@ function waitUntilDone(
 }
 
 /**
- * If the model re-emits `const factorial = () => { ... }`, keep only the body.
+ * If the model re-emits a full function wrapper, keep only the body.
  */
 function refineBodyInsert(text: string, before: string, lineBefore: string): string {
     let t = text.trimStart();
@@ -385,7 +376,7 @@ function refineBodyInsert(text: string, before: string, lineBefore: string): str
     return t;
 }
 
-/** Drop incomplete tails, flatten useless nesting, fix common factorial base-case bug. */
+/** Drop incomplete tails and flatten useless nested blocks. */
 function finishIncompleteBlock(text: string): string {
     let t = text.replace(/\s+$/, "");
     const lines = t.split("\n");
@@ -441,30 +432,6 @@ function finishIncompleteBlock(text: string): string {
         }
     }
 
-    return t;
-}
-
-/** Fix well-known wrong base cases when the surrounding name implies them. */
-function fixCommonMathBaseCases(text: string, contextHint: string): string {
-    let t = text;
-    if (!/\bfactorial\b|\bfactorialize\b/i.test(contextHint + "\n" + text)) {
-        return t;
-    }
-    // 0! = 1 — models often emit `if (n === 0) return 0`
-    t = t.replace(
-        /if\s*\(\s*n\s*===\s*0\s*\)\s*\{[^{}]*return\s+0\s*;[^{}]*\}/g,
-        "if (n === 0) {\n    return 1;\n  }",
-    );
-    t = t.replace(
-        /if\s*\(\s*n\s*===\s*0\s*\)\s*return\s+0\s*;/g,
-        "if (n === 0) return 1;",
-    );
-    t = t.replace(
-        /if\s*\(\s*n\s*==\s*0\s*\)\s*return\s+0\s*;/g,
-        "if (n == 0) return 1;",
-    );
-    // Prefer unified base: if (n === 0) return 1; else if (n === 1) return 1
-    // → if (n <= 1) return 1 when both return 1 (optional tidy — skip if complex)
     return t;
 }
 
@@ -715,13 +682,18 @@ function isLowQuality(text: string, ctx: DocumentContext, isIntent: boolean): bo
     if (t.startsWith("```") || /^here('s| is)\b/i.test(t)) {
         return true;
     }
-    // Placeholders
+    // Generic placeholders (not spread syntax `...x`)
     if (
         /your code here/i.test(t) ||
         /\bTODO\b/.test(t) ||
         /\bFIXME\b/.test(t) ||
-        t.includes("...")
+        /(^|\n)\s*\.\.\.\s*($|\n)/.test(t) ||
+        /\/\/\s*\.\.\./.test(t)
     ) {
+        return true;
+    }
+    // Likely pasted another local function from the same file into this body
+    if (isIntent && isCrossFunctionContamination(t, ctx.before || "")) {
         return true;
     }
     if (/\b([A-Za-z_$][\w$]*)\s+\1\b/.test(t)) {
@@ -730,7 +702,7 @@ function isLowQuality(text: string, ctx: DocumentContext, isIntent: boolean): bo
     if (/\b(const|let|var)\b.+\b(const|let|var)\b/.test(t) && !isIntent) {
         return true;
     }
-    // Duplicate return spam
+    // Duplicate return spam on single-line FIM
     if ((t.match(/\breturn\b/g) || []).length >= 3 && !isIntent) {
         return true;
     }
@@ -740,7 +712,7 @@ function isLowQuality(text: string, ctx: DocumentContext, isIntent: boolean): bo
             return true;
         }
     }
-    // Echo of a line that already exists just above/below (common with factorial spam)
+    // Echo of a nearby existing line (repeat loop)
     if (!isIntent && t.length > 8) {
         const after = ctx.after || "";
         const before = ctx.before || "";
@@ -757,6 +729,47 @@ function isLowQuality(text: string, ctx: DocumentContext, isIntent: boolean): bo
         /^\s*def\s+\w+/.test(t)
     ) {
         return true;
+    }
+    return false;
+}
+
+/**
+ * Heuristic: body calls another user-defined function that appears earlier in
+ * *this file* but is not the function being written (likely copy-paste from context).
+ * Allows recursive self-calls. Does not hardcode algorithm names.
+ */
+function isCrossFunctionContamination(body: string, before: string): boolean {
+    const names = [...before.matchAll(/(?:function|const|let|var|def)\s+([\w$]+)/gi)].map(
+        (m) => m[1],
+    );
+    if (names.length < 2) {
+        return false;
+    }
+    const current = names[names.length - 1];
+    const others = new Set(
+        names.slice(0, -1).filter((n) => n.toLowerCase() !== current.toLowerCase()),
+    );
+    if (others.size === 0) {
+        return false;
+    }
+    const builtins = new Set([
+        "if", "for", "while", "switch", "catch", "function", "return",
+        "parseInt", "parseFloat", "Number", "String", "Boolean", "Array",
+        "Object", "Math", "JSON", "console", "setTimeout", "setInterval",
+        "Promise", "Error", "Map", "Set", "Date", "RegExp", "Symbol",
+        "isNaN", "isFinite", "encodeURIComponent", "decodeURIComponent",
+        "require", "fetch", "Buffer", "process",
+    ]);
+    const callRe = /\b([A-Za-z_$][\w$]*)\s*\(/g;
+    let m: RegExpExecArray | null;
+    while ((m = callRe.exec(body)) !== null) {
+        const callee = m[1];
+        if (builtins.has(callee)) {
+            continue;
+        }
+        if (others.has(callee) && callee.toLowerCase() !== current.toLowerCase()) {
+            return true;
+        }
     }
     return false;
 }

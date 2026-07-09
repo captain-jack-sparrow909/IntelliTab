@@ -204,38 +204,26 @@ class ModelEngine:
         after: str,
         language: str = "",
     ) -> str:
-        before = _truncate(before, 2800, from_end=True)
-        after = _truncate(after, 500, from_end=False)
+        # Tight context = faster prefill (dominant latency cost).
+        before = _truncate(before, 2200, from_end=True)
+        after = _truncate(after, 400, from_end=False)
 
-        # Instruct: few-shot style "suffix only" — models love to re-emit the line
-        # or wrap in ``` otherwise (seen in logs: raw="```javascript").
-        if self._is_instruct and self._has_chat:
+        # Native FIM is ~2–3× faster than chat on Instruct models and accurate
+        # for mid-expression sites (after `=>`, `=`, `(`, etc.).
+        # Mid-identifier after `const name` is ambiguous for pure FIM,
+        # so use a compact chat prompt only in that case.
+        use_fim = self._has_fim and _fim_site_ok(before)
+
+        if use_fim:
+            return f"{FIM_PREFIX}{before}{FIM_SUFFIX}{after}{FIM_MIDDLE}"
+
+        if self._has_chat:
             lang = _lang_name(language)
             system = (
-                "You are a code completion engine for an IDE.\n"
-                "Rules:\n"
-                "1. Output ONLY the characters that should be inserted at <CURSOR>.\n"
-                "2. Do NOT repeat any characters that already appear before <CURSOR>.\n"
-                "3. Do NOT output markdown fences or language tags (no ```).\n"
-                "4. Do NOT output explanations.\n"
-                "5. Prefer a short completion (usually the rest of the current line).\n"
-                f"6. Language: {lang}."
+                "IDE code completion. Output ONLY text to insert at <CURSOR>. "
+                "No markdown, no explanation, do not repeat code before <CURSOR>."
             )
-            # One concrete example so the model copies the "suffix only" format.
-            example = (
-                "Example:\n"
-                "Before: const add = (a, b) => <CURSOR>\n"
-                "After: \\n\n"
-                "Your output: a + b\n"
-                "(NOT: const add = (a, b) => a + b)\n"
-                "(NOT: ```javascript ... ```)"
-            )
-            user = (
-                f"{example}\n\n"
-                f"Before: {before}<CURSOR>\n"
-                f"After: {after if after else '(end)'}\n"
-                "Your output:"
-            )
+            user = f"{before}<CURSOR>{after}\nInsert ({lang}):"
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -246,7 +234,6 @@ class ModelEngine:
 
         if self._has_fim:
             return f"{FIM_PREFIX}{before}{FIM_SUFFIX}{after}{FIM_MIDDLE}"
-
         return before
 
     def build_intent_prompt(
@@ -257,7 +244,7 @@ class ModelEngine:
     ) -> str:
         intent = intent.strip()
         lang = _lang_name(language)
-        surrounding = _truncate((context or "").strip(), 2400, from_end=True)
+        surrounding = _truncate((context or "").strip(), 1600, from_end=True)
 
         if self._has_fim and not self._is_instruct:
             comment = {
@@ -271,41 +258,30 @@ class ModelEngine:
             return f"{FIM_PREFIX}{prefix}{FIM_SUFFIX}{FIM_MIDDLE}"
 
         if self._has_chat:
+            target = _nearest_signature_name(intent, surrounding)
             system = (
-                f"You complete {lang} code inside an IDE.\n"
+                f"You are a {lang} code completion engine inside an IDE.\n"
+                "Output ONLY the code to insert at the cursor (usually a function body).\n"
                 "Rules:\n"
-                "1. Output ONLY the code to insert at the cursor (usually a function body).\n"
-                "2. Do NOT repeat the function/const signature if it is already in the file.\n"
-                "3. Do NOT use placeholders like 'Your code here', TODO, or '...'.\n"
-                "4. Do NOT use markdown fences.\n"
-                "5. Write complete, balanced braces/parens; finish every statement.\n"
-                "6. Prefer a clear iterative or recursive solution; keep it short.\n"
-                "7. Match indentation of the surrounding code.\n"
-                "8. Be mathematically correct. Examples:\n"
-                "   - factorial: 0! = 1 and 1! = 1 (never return 0 for n===0).\n"
-                "   - Prefer: if (n <= 1) return 1; return n * f(n-1);\n"
-                "9. Do NOT add useless nested blocks like `{ { return x; } }` — use a single block.\n"
-                "10. One clean control-flow structure; no duplicated ifs."
+                "- Do not repeat an existing signature.\n"
+                "- No markdown fences, no explanations, no placeholders "
+                "(no 'TODO', 'Your code here', '...').\n"
+                "- Implement the function currently being written; do not paste logic "
+                "from other functions that appear in the file context.\n"
+                "- Prefer correct, idiomatic, complete code with balanced braces/parens.\n"
+                "- Keep the body as short as correctness allows."
             )
-            user = f"Task:\n{intent}"
+            user_parts = [f"Request:\n{intent}"]
+            if target:
+                user_parts.append(f"Current function name: {target}")
             if surrounding:
-                user += (
-                    "\n\nFile context (cursor is inside; insert BODY ONLY):\n"
-                    f"{surrounding}\n"
-                    "\nCorrect body only:"
+                user_parts.append(
+                    "Surrounding file (for names/types/style only):\n" + surrounding
                 )
-            else:
-                user += "\n\nCode:"
-            # Few-shot when the task looks like factorial — anchors base case.
-            if re.search(r"factorial|factorialize", intent + "\n" + surrounding, re.I):
-                user += (
-                    "\n\nReference (structure only; adapt names):\n"
-                    "if (n <= 1) {\n  return 1;\n}\n"
-                    "return n * factorial(n - 1);\n"
-                )
+            user_parts.append("Code to insert:")
             messages = [
                 {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "user", "content": "\n\n".join(user_parts)},
             ]
             return self.tokenizer.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False
@@ -339,15 +315,14 @@ class ModelEngine:
         max_tokens: Optional[int] = None,
         msg_id: Optional[int] = None,
         stop_on_newline: bool = False,
+        stop_when_balanced: bool = False,
         should_stop: Optional[Callable[[], bool]] = None,
     ):
         """
         Yield (token, is_final).
 
-        stop_on_newline semantics (fixed for FIM):
-        - Ignore leading newlines / blank tokens (common FIM preamble)
-        - After any non-whitespace has been emitted, stop at the next newline
-          (keeps a full first line, not 0–2 words)
+        stop_on_newline: FIM mid-line — first real line only.
+        stop_when_balanced: intent bodies — stop once braces/parens balance.
         """
         max_tok = max_tokens or self.max_tokens
         self._active_id = msg_id
@@ -357,7 +332,8 @@ class ModelEngine:
             count = 0
             emitted_any = False
             skipping_lead = True
-            buf = ""  # accumulate so we can drop ``` fences before stopping
+            buf = ""
+            acc = ""
 
             for item in stream_generate(
                 self.model,
@@ -379,8 +355,6 @@ class ModelEngine:
 
                 count += 1
 
-                # Strip markdown fence openers the model often emits first.
-                # e.g. "```javascript\n" must not become the whole completion.
                 if skipping_lead:
                     buf += token
                     stripped = buf.lstrip("\r\n")
@@ -409,7 +383,6 @@ class ModelEngine:
                     if not stripped:
                         buf = ""
                         continue
-                    # First real code chunk
                     skipping_lead = False
                     token = stripped
                     buf = ""
@@ -417,7 +390,6 @@ class ModelEngine:
                 if stop_on_newline:
                     if "\n" in token:
                         before_nl, _sep, _rest = token.partition("\n")
-                        # Ignore newline-only if we have no real code yet
                         if not before_nl.strip() and not emitted_any:
                             continue
                         if before_nl:
@@ -442,8 +414,16 @@ class ModelEngine:
                         return
                     continue
 
-                yield (token, count >= max_tok)
+                yield (token, False)
+                acc += token
+                emitted_any = True
+
+                if stop_when_balanced and _looks_complete_body(acc):
+                    yield ("", True)
+                    return
+
                 if count >= max_tok:
+                    yield ("", True)
                     return
         except Exception as e:
             sys.stderr.write(f"[mlx] Stream generation error: {e}\n")
@@ -453,3 +433,85 @@ class ModelEngine:
             self._clear_cancel(msg_id)
             if self._active_id == msg_id:
                 self._active_id = None
+
+
+def _fim_site_ok(before: str) -> bool:
+    """True when FIM is the better (and faster) choice for this cursor site."""
+    s = before.rstrip("\n")
+    if not s:
+        return True
+    if s[-1] in "=.([{,;:+-*/%<>!&|? \t":
+        return True
+    if s.endswith("=>") or s.endswith("->") or s.endswith("::"):
+        return True
+    # `const name` without `=` — pure FIM often continues the identifier wrongly
+    if re.search(r"(?:const|let|var)\s+[\w$]+$", s):
+        return False
+    if re.search(r"\.\w+$", s):
+        return True
+    return True
+
+
+def _nearest_signature_name(intent: str, surrounding: str) -> str:
+    """Best-effort name of the function currently being written."""
+    for blob in (intent, surrounding):
+        for line in reversed(blob.splitlines()):
+            m = re.search(
+                r"(?:function\s+|const\s+|let\s+|var\s+|def\s+)([\w$]+)",
+                line,
+            )
+            if m:
+                return m.group(1)
+            m = re.search(r"([\w$]+)\s*\([^)]*\)\s*(?:=>|\{|:)", line)
+            if m and m.group(1) not in ("if", "for", "while", "switch", "catch"):
+                return m.group(1)
+    return ""
+
+
+def _looks_complete_body(text: str) -> bool:
+    """True when a multi-line body looks finished (early-stop to save decode)."""
+    t = text.strip()
+    if len(t) < 20:
+        return False
+    # Balanced braces
+    depth = 0
+    for ch in t:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+    if depth != 0:
+        return False
+    # Balanced parens / brackets
+    for open_c, close_c in (("(", ")"), ("[", "]")):
+        p = 0
+        for ch in t:
+            if ch == open_c:
+                p += 1
+            elif ch == close_c:
+                p -= 1
+                if p < 0:
+                    return False
+        if p != 0:
+            return False
+    # Must end on a finished statement — not mid-assignment / mid-keyword
+    if re.search(r"\b(for|if|while|function|const|let|var|return|else)\s*$", t):
+        return False
+    if re.search(r"[=+\-*/%,.]\s*$", t):  # ends with operator → incomplete
+        return False
+    if not re.search(r"[;}]\s*$", t):
+        return False
+    # Local bindings but no return yet — often still incomplete (keep decoding)
+    if (
+        re.search(r"\b(const|let|var)\s+[\w$]+", t)
+        and "return" not in t
+        and not re.search(r"\b(throw|console\.|process\.)", t)
+    ):
+        return False
+    if "return" in t and re.search(r"[;}]\s*$", t):
+        return True
+    if t.rstrip().endswith("}") and "return" in t and len(t) > 40:
+        return True
+    return False

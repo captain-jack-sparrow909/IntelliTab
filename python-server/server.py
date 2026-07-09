@@ -53,16 +53,18 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
 
     t0 = time.perf_counter()
     try:
+        stop_when_balanced = False
         if is_intent:
             prompt = engine.build_intent_prompt(
                 context.get("intent") or "Implement the code",
                 language,
                 context.get("before", ""),
             )
-            # Full function bodies need room; still capped for latency.
-            max_tokens = max(max_tokens, 128)
-            max_tokens = min(max_tokens, 220)
+            # Full bodies, but early-stop when balanced (see model.stream).
+            max_tokens = max(max_tokens, 96)
+            max_tokens = min(max_tokens, 160)
             stop_on_newline = False
+            stop_when_balanced = True
             mode = "intent"
         else:
             prompt = engine.build_fim_prompt(
@@ -70,9 +72,8 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
                 context.get("after", ""),
                 language=language,
             )
-            # Full first line (~return a + b;) needs more than a couple tokens.
-            max_tokens = max(24, min(max_tokens, 48))
-            # Default: stop after first real line (leading \n is ignored in model.stream).
+            # One line is enough for mid-line FIM.
+            max_tokens = max(16, min(max_tokens, 32))
             if "stop_on_newline" not in msg and "stopOnNewline" not in msg:
                 stop_on_newline = True
             mode = "fim"
@@ -86,6 +87,7 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
                 max_tokens=max_tokens,
                 msg_id=msg_id,
                 stop_on_newline=stop_on_newline,
+                stop_when_balanced=stop_when_balanced,
             ):
                 if token:
                     if first_token_ms is None:
