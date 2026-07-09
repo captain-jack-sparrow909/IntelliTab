@@ -60,10 +60,11 @@ def handle_complete(engine: ModelEngine, msg: dict, write) -> None:
                 language,
                 context.get("before", ""),
             )
-            # Full bodies, but early-stop when balanced (see model.stream).
-            max_tokens = max(max_tokens, 96)
-            max_tokens = min(max_tokens, 160)
+            # Spec / multi-line comment tasks need more room; early-stop when balanced.
+            max_tokens = max(max_tokens, 128)
+            max_tokens = min(max_tokens, 256)
             stop_on_newline = False
+            # Only early-stop when structure looks finished (avoids cutting try: mid-block).
             stop_when_balanced = True
             mode = "intent"
         else:

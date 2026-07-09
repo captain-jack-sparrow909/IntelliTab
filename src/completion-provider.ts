@@ -682,14 +682,31 @@ function isLowQuality(text: string, ctx: DocumentContext, isIntent: boolean): bo
     if (t.startsWith("```") || /^here('s| is)\b/i.test(t)) {
         return true;
     }
-    // Generic placeholders (not spread syntax `...x`)
+    // Generic placeholders / stubs (not spread syntax `...x`)
     if (
         /your code here/i.test(t) ||
+        /your prediction logic/i.test(t) ||
+        /placeholder for/i.test(t) ||
         /\bTODO\b/.test(t) ||
         /\bFIXME\b/.test(t) ||
         /(^|\n)\s*\.\.\.\s*($|\n)/.test(t) ||
-        /\/\/\s*\.\.\./.test(t)
+        /\/\/\s*\.\.\./.test(t) ||
+        /#\s*For example:/i.test(t)
     ) {
+        return true;
+    }
+    // try without except/finally (incomplete control flow)
+    if (/\btry\s*:/.test(t) && !/\bexcept\b/.test(t) && !/\bfinally\b/.test(t)) {
+        return true;
+    }
+    if (/\btry\s*\{/.test(t) && !/\bcatch\b/.test(t) && !/\bfinally\b/.test(t)) {
+        return true;
+    }
+    // Trailing unfinished def/async def / function header with no body
+    if (/(?:async\s+)?def\s+\w+\s*\([^)]*\)\s*:\s*$/m.test(t)) {
+        return true;
+    }
+    if (/(?:async\s+)?function\s*\w*\s*\([^)]*\)\s*\{\s*$/m.test(t)) {
         return true;
     }
     // Likely pasted another local function from the same file into this body

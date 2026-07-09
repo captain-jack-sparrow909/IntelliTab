@@ -261,15 +261,17 @@ class ModelEngine:
             target = _nearest_signature_name(intent, surrounding)
             system = (
                 f"You are a {lang} code completion engine inside an IDE.\n"
-                "Output ONLY the code to insert at the cursor (usually a function body).\n"
+                "Output ONLY the code to insert at the cursor.\n"
                 "Rules:\n"
-                "- Do not repeat an existing signature.\n"
-                "- No markdown fences, no explanations, no placeholders "
-                "(no 'TODO', 'Your code here', '...').\n"
-                "- Implement the function currently being written; do not paste logic "
-                "from other functions that appear in the file context.\n"
-                "- Prefer correct, idiomatic, complete code with balanced braces/parens.\n"
-                "- Keep the body as short as correctness allows."
+                "- No markdown fences, no prose explanations.\n"
+                "- No placeholders (no TODO, 'Your code here', stub comments).\n"
+                "- Produce complete, runnable code: every try has except/finally, "
+                "names you use must be defined or imported, blocks must be indented correctly.\n"
+                "- If the request is a multi-line specification, implement the full request "
+                "in one coherent snippet.\n"
+                "- Do not invent trailing dead code or unfinished function stubs.\n"
+                "- Prefer correct, idiomatic code; keep it as short as correctness allows.\n"
+                "- Do not paste unrelated functions from the surrounding file."
             )
             user_parts = [f"Request:\n{intent}"]
             if target:
@@ -503,15 +505,35 @@ def _looks_complete_body(text: str) -> bool:
         return False
     if not re.search(r"[;}]\s*$", t):
         return False
+    # try without except/finally → incomplete
+    if re.search(r"\btry\s*:", t) and not re.search(r"\bexcept\b|\bfinally\b", t):
+        return False
+    if re.search(r"\btry\s*\{", t) and not re.search(r"\bcatch\b|\bfinally\b", t):
+        return False
+    # Trailing unfinished def/function header
+    if re.search(r"(?:async\s+)?def\s+\w+\s*\([^)]*\)\s*:\s*$", t):
+        return False
     # Local bindings but no return yet — often still incomplete (keep decoding)
     if (
         re.search(r"\b(const|let|var)\s+[\w$]+", t)
         and "return" not in t
-        and not re.search(r"\b(throw|console\.|process\.)", t)
+        and not re.search(r"\b(throw|console\.|process\.|raise\b|logging\.)", t)
     ):
         return False
     if "return" in t and re.search(r"[;}]\s*$", t):
         return True
+    # Python-style complete: ends with return / raise / pass block
+    if re.search(r"\b(return|raise|pass)\b", t) and (
+        re.search(r"[;:]\s*$", t) is None or t.rstrip().endswith((")", "]", "}", '"', "'"))
+    ):
+        # Prefer ending after a full indented block
+        if not re.search(r":\s*$", t):
+            return True
     if t.rstrip().endswith("}") and "return" in t and len(t) > 40:
         return True
+    # Python file-level: has def and ends cleanly without open try
+    if re.search(r"\bdef\s+\w+", t) and re.search(r"\breturn\b", t) and not re.search(r":\s*$", t):
+        if re.search(r"\btry\s*:", t):
+            return bool(re.search(r"\bexcept\b|\bfinally\b", t))
+        return len(t) > 80
     return False
